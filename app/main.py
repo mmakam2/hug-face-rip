@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .backup import JobRunner, detect_repo_types, repo_total_bytes, delete_backup_files
 from .config import load_settings
-from .db import COMPLETED, FAILED, JobStore, QUEUED, RUNNING
+from .db import COMPLETED, FAILED, JobStore, PAUSED, QUEUED, RUNNING
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -103,13 +103,44 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         runner.submit(job_id)
         return store.get_job(job_id).to_dict()
 
+    @app.post("/api/jobs/{job_id}/pause")
+    def pause(job_id: int):
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.status != RUNNING:
+            raise HTTPException(status_code=409, detail="only running downloads can be paused")
+        runner.pause(job_id)
+        return {"pausing": job_id}
+
+    @app.post("/api/jobs/{job_id}/resume")
+    def resume(job_id: int):
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.status != PAUSED:
+            raise HTTPException(status_code=409, detail="only paused downloads can be resumed")
+        store.requeue(job_id)
+        runner.submit(job_id)
+        return store.get_job(job_id).to_dict()
+
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel(job_id: int):
         job = store.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        if job.status != QUEUED:
-            raise HTTPException(status_code=409, detail="only queued jobs can be cancelled")
+        if job.status not in (QUEUED, RUNNING, PAUSED):
+            raise HTTPException(
+                status_code=409,
+                detail="only queued, running, or paused jobs can be cancelled",
+            )
+        if job.status == RUNNING:
+            # Hand off to the runner; the worker deletes files + row once the
+            # child process dies (near-instant, even mid-file).
+            runner.cancel(job_id)
+            return {"cancelling": job_id}
+        # queued / paused: no live process — discard partial files + row directly.
+        delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
         store.delete_job(job_id)
         return {"deleted": job_id}
 

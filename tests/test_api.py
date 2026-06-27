@@ -1,17 +1,26 @@
 import pytest
 from fastapi.testclient import TestClient
 from app.config import Settings
-from app.db import JobStore, FAILED, QUEUED
+from app.db import JobStore, FAILED, QUEUED, PAUSED, RUNNING
 from app.main import create_app
 
 
 class FakeRunner:
     def __init__(self):
         self.submitted = []
+        self.paused = []
+        self.cancelled = []
         self.shutdowns = 0
 
     def submit(self, job_id):
         self.submitted.append(job_id)
+
+    def pause(self, job_id):
+        self.paused.append(job_id)
+
+    def cancel(self, job_id):
+        self.cancelled.append(job_id)
+        return True
 
     def shutdown(self, wait=False):
         self.shutdowns += 1
@@ -132,11 +141,13 @@ def test_cancel_removes_queued_job_from_the_list(ctx):
     assert client.get("/api/jobs").json()["jobs"] == []   # leaves the list
 
 
-def test_cancel_running_job_is_rejected(ctx):
+def test_cancel_running_job_terminates_it(ctx):
     client, store, runner = ctx
     job = store.create_job("a/b", "model")
-    store.set_status(job.id, "running")
-    assert client.post(f"/api/jobs/{job.id}/cancel").status_code == 409
+    store.set_status(job.id, RUNNING)
+    resp = client.post(f"/api/jobs/{job.id}/cancel")
+    assert resp.status_code == 200
+    assert job.id in runner.cancelled        # handed to the runner to terminate
 
 
 def test_readd_after_cancel_does_not_resurrect_cancelled_instances(ctx):
@@ -265,4 +276,79 @@ def test_lifespan_shuts_down_runner_on_exit(tmp_path):
         pass
     # exiting the context triggers lifespan shutdown
     assert runner.shutdowns == 1
+    store.close()
+
+
+def test_pause_only_running(ctx):
+    client, store, runner = ctx
+    job = store.create_job("a/b", "model")
+    assert client.post(f"/api/jobs/{job.id}/pause").status_code == 409   # queued
+    store.set_status(job.id, RUNNING)
+    resp = client.post(f"/api/jobs/{job.id}/pause")
+    assert resp.status_code == 200
+    assert job.id in runner.paused
+
+
+def test_pause_missing_job_404(ctx):
+    client, store, runner = ctx
+    assert client.post("/api/jobs/999/pause").status_code == 404
+
+
+def test_resume_only_paused(ctx):
+    client, store, runner = ctx
+    job = store.create_job("a/b", "model")
+    assert client.post(f"/api/jobs/{job.id}/resume").status_code == 409  # queued
+    store.set_status(job.id, PAUSED)
+    resp = client.post(f"/api/jobs/{job.id}/resume")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == QUEUED
+    assert job.id in runner.submitted
+
+
+def test_resume_missing_job_404(ctx):
+    client, store, runner = ctx
+    assert client.post("/api/jobs/999/resume").status_code == 404
+
+
+def test_cancel_paused_deletes_files_and_row(ctx, tmp_path):
+    client, store, runner = ctx
+    from app.backup import local_dir_for
+    backup = tmp_path / "backups"
+    job = store.create_job("o/n", "model")
+    d = local_dir_for(backup, "model", "o/n")
+    d.mkdir(parents=True)
+    (d / "partial.bin").write_bytes(b"x" * 10)
+    store.set_status(job.id, PAUSED)
+    resp = client.post(f"/api/jobs/{job.id}/cancel")
+    assert resp.status_code == 200
+    assert store.get_job(job.id) is None      # row gone
+    assert not d.exists()                      # files gone
+    assert runner.cancelled == []              # no live process; deleted directly
+
+
+def test_cancel_queued_deletes_partial_files(ctx, tmp_path):
+    client, store, runner = ctx
+    from app.backup import local_dir_for
+    backup = tmp_path / "backups"
+    job = store.create_job("o/n", "model")     # queued, but partial bytes on disk
+    d = local_dir_for(backup, "model", "o/n")
+    d.mkdir(parents=True)
+    (d / "partial.bin").write_bytes(b"x" * 10)
+    resp = client.post(f"/api/jobs/{job.id}/cancel")
+    assert resp.status_code == 200
+    assert store.get_job(job.id) is None
+    assert not d.exists()
+
+
+def test_startup_does_not_resume_paused_jobs(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(settings.db_path)
+    paused = store.create_job("stay/paused", "model")
+    store.set_status(paused.id, PAUSED)
+    runner = FakeRunner()
+    app = create_app(settings, store, runner, detect=lambda s, t: [])
+    with TestClient(app):
+        pass
+    assert paused.id not in runner.submitted   # paused jobs are NOT auto-resumed
     store.close()
