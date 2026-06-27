@@ -59,3 +59,11 @@ def test_running_and_paused_rows_expose_pause_resume_cancel(client):
     assert ">Resume<" in page         # paused rows can be resumed
     assert "confirmCancel" in page    # cancel is confirm-guarded (now destroys data)
     assert ".st.paused" in page       # paused status has its own color rule
+
+
+def test_global_pause_and_retrying_ui_present(client):
+    page = client.get("/").text
+    assert "pause-all" in page          # global pause endpoint wired
+    assert "resume-all" in page         # global resume endpoint wired
+    assert ".st.retrying" in page       # retrying status color rule
+    assert "retryText" in page          # helper that renders "N/5 · next in …"
