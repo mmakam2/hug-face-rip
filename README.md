@@ -10,14 +10,32 @@ live progress, and automatic resume.
    ```bash
    .venv/bin/python -m pip install -r requirements.txt
    ```
-2. Create a `.env` (see `.env.example`):
+2. Create your `.env` from the template and add your Hugging Face token:
+   ```bash
+   cp .env.example .env
    ```
-   HUGGINGFACE_ACCESS_KEY=hf_your_token_here
-   BACKUP_DIR=./backups
-   MAX_CONCURRENT_JOBS=2
-   MAX_WORKERS=8
-   DB_PATH=jobs.db
-   ```
+   See [Configuration](#configuration) below for what each setting does.
+
+## Configuration
+
+All settings are environment variables, read at startup from a `.env` file in
+the working directory (via `python-dotenv`) and/or the real environment. For the
+systemd service they're set in the unit file instead (see below). `.env.example`
+is a documented template — copy it to `.env` to start.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HUGGINGFACE_ACCESS_KEY` | **yes** | — | HF access token ([create one](https://huggingface.co/settings/tokens)). Needs read access to the repos you back up; required even for public repos. |
+| `BACKUP_DIR` | **yes** | — | Where backups are written. Created if missing, must be writable. Each repo lands in `BACKUP_DIR/<repo_type>s/<owner>/<name>`. |
+| `MAX_CONCURRENT_JOBS` | no | `2` | How many repos download at once. |
+| `MAX_WORKERS` | no | `8` | How many files download in parallel within each repo. |
+| `DB_PATH` | no | `jobs.db` | SQLite job-database path (the queue + progress). |
+| `HOST` | no | `0.0.0.0` | Bind address. `0.0.0.0` exposes the dashboard to the network; use `127.0.0.1` for this machine only. |
+| `PORT` | no | `8000` | Bind port. |
+
+> **Memory:** peak RAM scales with `MAX_CONCURRENT_JOBS` × `MAX_WORKERS` (repos
+> in parallel × files per repo), so lower both on a small host. The Xet
+> downloader matters even more — see [Tuning for memory](#tuning-for-memory-the-xet-gotcha).
 
 ## Run
 
@@ -69,6 +87,20 @@ sudo systemctl status hf-backup.service
 
 It restarts on failure and, because the app re-queues unfinished jobs on
 startup, an interrupted download resumes automatically.
+
+Configuration lives in the `[Service]` block of the unit (`Environment=` lines
+and `MemoryMax=`), **not** in `.env` — `.env` values do not override variables
+systemd already set. Follow the logs, and apply config or code changes, with:
+
+```bash
+journalctl -u hf-backup -f                            # follow the logs
+sudo cp deploy/hf-backup.service /etc/systemd/system/ # only if you edited the unit
+sudo systemctl daemon-reload                          # only after editing the unit
+sudo systemctl restart hf-backup                      # picks up new env + working-tree code
+```
+
+`Environment=` and `MemoryMax=` changes take effect only on restart. The service
+runs from the working tree, so a restart also picks up pulled code changes.
 
 ### Tuning for memory (the Xet gotcha)
 
