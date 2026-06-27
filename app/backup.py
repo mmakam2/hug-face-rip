@@ -1,3 +1,4 @@
+import json
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -11,8 +12,9 @@ from huggingface_hub.utils import (
     RepositoryNotFoundError,
 )
 
-from .db import PAUSED
+from .db import PAUSED, VERIFYING, COMPLETED
 from .retry import is_retryable, BACKOFF_SECONDS, MAX_RETRIES
+from .verify import verify_repo, expected_file_hashes, VerifyAborted
 
 REPO_TYPES = ["model", "dataset", "space"]
 
@@ -35,6 +37,14 @@ def repo_total_bytes(slug: str, repo_type: str, token: str, api: Optional[HfApi]
         repo_id=slug, repo_type=repo_type, token=token or None, files_metadata=True
     )
     return sum((sibling.size or 0) for sibling in (info.siblings or []))
+
+
+def repo_expected_hashes(slug: str, repo_type: str, token: str, api: Optional[HfApi] = None):
+    api = api or HfApi()
+    info = api.repo_info(
+        repo_id=slug, repo_type=repo_type, token=token or None, files_metadata=True
+    )
+    return expected_file_hashes(info.siblings or [])
 
 
 def local_dir_for(backup_dir: Path, repo_type: str, slug: str) -> Path:
@@ -92,6 +102,16 @@ def free_disk_bytes(path) -> int:
 
 
 POLL_INTERVAL = 1.5
+
+
+class _StopHandle:
+    """Registry handle for the verify phase. terminate() sets the stop event the
+    hashing loop checks between chunks — there's no child process to kill."""
+    def __init__(self, stop) -> None:
+        self._stop = stop
+
+    def terminate(self) -> None:
+        self._stop.set()
 
 
 class RunningRegistry:
@@ -228,8 +248,16 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
             # Finished before any stop signal landed -> completion wins.
             final = directory_size(local_dir)
             store.update_progress(job_id, total if total else final, total_bytes=total)
-            store.set_status(job_id, "completed")
             store.reset_retry(job_id)
+            if settings.verify_downloads:
+                # Drop the download handle/intent so verification starts from a
+                # clean slate (a stale stop that lost to completion won't suppress it).
+                if registry is not None:
+                    registry.unregister(job_id)
+                _verify_phase(job_id, store, settings, api=api,
+                              registry=registry, stopping=stopping)
+            else:
+                store.set_status(job_id, "completed")
         elif intent == "pause":
             store.set_status(job_id, PAUSED)
         elif intent == "cancel":
@@ -259,6 +287,72 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
     finally:
         if registry is not None:
             registry.unregister(job_id)
+
+
+def _verify_phase(job_id, store, settings, api=None, registry=None, stopping=None) -> None:
+    """Hash a job's files against the Hub's reported hashes and record the verdict.
+    Always lands the job at 'completed': verified, corrupted, or — if it was
+    interrupted or the Hub was unreachable — unverified. Never deletes or requeues."""
+    job = store.get_job(job_id)
+    if job is None:
+        return
+    store.set_status(job_id, VERIFYING)
+    local_dir = local_dir_for(settings.backup_dir, job.repo_type, job.slug)
+    total = job.total_bytes
+
+    # The caller (download path) clears the download handle/intent before calling
+    # us, so we must NOT unregister at the top — on the manual path a stop_verify
+    # intent may have been preset between submit and now, and the post-register
+    # check below relies on it still being present. The single outer finally
+    # always unregisters, clearing the handle and any (preset or leaked) intent.
+    try:
+        try:
+            expected = repo_expected_hashes(job.slug, job.repo_type, settings.hf_token, api=api)
+        except Exception:  # noqa: BLE001 - cannot-verify is NOT corruption
+            store.update_progress(job_id, total)
+            store.set_status(job_id, COMPLETED)
+            store.set_verify_status(
+                job_id, "unverified",
+                detail=json.dumps({"note": "could not reach the Hub to verify; try again"}))
+            return
+
+        stop = threading.Event()
+        if registry is not None:
+            registry.register(job_id, _StopHandle(stop))
+            # Honor a stop that landed between submit/claim and registration, or a closed valve.
+            if (store.get_flag("paused_all", "0") == "1"
+                    or registry.intent(job_id) is not None
+                    or (stopping is not None and stopping.is_set())):
+                stop.set()
+
+        aborted = False
+        try:
+            report = verify_repo(
+                local_dir, expected, stop=stop,
+                on_progress=lambda n: store.update_progress(job_id, n))
+        except VerifyAborted:
+            aborted = True
+            report = None
+
+        store.update_progress(job_id, total)   # restore the bar to 100%
+        store.set_status(job_id, COMPLETED)
+        if aborted or (stopping is not None and stopping.is_set()):
+            store.set_verify_status(job_id, "unverified", detail=None)
+        elif report.ok:
+            store.set_verify_status(job_id, "verified", detail=None)
+        else:
+            store.set_verify_status(
+                job_id, "corrupted", detail=json.dumps({"failures": report.failures}))
+    finally:
+        if registry is not None:
+            registry.unregister(job_id)
+
+
+def run_verify_job(job_id, store, settings, api=None, registry=None, stopping=None) -> None:
+    """Dispatcher/executor entry point for a manual verify on a completed job."""
+    if store.get_job(job_id) is None:
+        return
+    _verify_phase(job_id, store, settings, api=api, registry=registry, stopping=stopping)
 
 
 DISPATCH_INTERVAL = 1.0
@@ -314,6 +408,20 @@ class JobRunner:
         """Stop a running download; the worker deletes its files + row once the
         child dies. Returns True if a live download was terminated."""
         return self._registry.request(job_id, "cancel")
+
+    def verify(self, job_id) -> None:
+        """Run an integrity check on a completed job (manual Verify button). Marks
+        it 'verifying' up front so a second click is rejected and it occupies a
+        slot, then runs on the shared executor (max_concurrent_jobs still bounds it)."""
+        self._store.set_status(job_id, VERIFYING)
+        self._executor.submit(
+            run_verify_job, job_id, self._store, self._settings,
+            self._api, self._registry, self._stopping,
+        )
+
+    def stop_verify(self, job_id) -> None:
+        """Stop an in-progress verification; the worker lands it back at completed."""
+        self._registry.request(job_id, "stop_verify")
 
     def pause_all(self) -> None:
         """Close the global valve and return every running download to 'queued'
