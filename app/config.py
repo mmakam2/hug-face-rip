@@ -15,6 +15,7 @@ class Settings:
     max_concurrent_jobs: int
     max_workers: int
     db_path: Path
+    verify_downloads: bool = True
 
 
 def _int(env: Mapping[str, str], key: str, default: int) -> int:
@@ -25,6 +26,13 @@ def _int(env: Mapping[str, str], key: str, default: int) -> int:
         return int(raw)
     except ValueError:
         raise ConfigError(f"{key} must be an integer, got {raw!r}")
+
+
+def _bool(env: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = env.get(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
@@ -52,4 +60,5 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         max_concurrent_jobs=_int(env, "MAX_CONCURRENT_JOBS", 2),
         max_workers=_int(env, "MAX_WORKERS", 8),
         db_path=Path(env.get("DB_PATH") or "jobs.db"),
+        verify_downloads=_bool(env, "VERIFY_DOWNLOADS", True),
     )

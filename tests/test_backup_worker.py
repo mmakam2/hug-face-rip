@@ -3,9 +3,11 @@ import time
 from pathlib import Path
 import pytest
 from app.config import Settings
+import hashlib
+import json
 import socket
-from app.db import JobStore, COMPLETED, FAILED, CANCELLED, RUNNING, PAUSED, QUEUED, RETRYING
-from app.backup import run_backup_job, JobRunner, RunningRegistry
+from app.db import JobStore, COMPLETED, FAILED, CANCELLED, RUNNING, PAUSED, QUEUED, RETRYING, VERIFYING
+from app.backup import run_backup_job, run_verify_job, JobRunner, RunningRegistry, local_dir_for
 from app.launcher import Outcome
 from app.retry import is_retryable, BACKOFF_SECONDS, MAX_RETRIES
 
@@ -86,13 +88,69 @@ class FakeApi:
         return _Info([_Sibling(self._total)])
 
 
-def make_settings(tmp_path, max_jobs=2):
+def _git_blob_sha1_bytes(data: bytes) -> str:
+    return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\x00" + data).hexdigest()
+
+
+class _Lfs:
+    def __init__(self, sha256):
+        self.sha256 = sha256
+
+
+class _VSibling:
+    def __init__(self, rfilename, size, blob_id=None, lfs=None):
+        self.rfilename = rfilename
+        self.size = size
+        self.blob_id = blob_id
+        self.lfs = lfs
+
+
+class VerifyApi:
+    """repo_info reports the hashes of `truth` (name -> bytes). Files ending in
+    .bin are reported as LFS (lfs.sha256); everything else via git blob sha1."""
+    def __init__(self, truth):
+        self._truth = truth
+
+    def repo_info(self, repo_id, repo_type, token=None, files_metadata=False):
+        sibs = []
+        for name, data in self._truth.items():
+            if name.endswith(".bin"):
+                sibs.append(_VSibling(name, len(data), lfs=_Lfs(hashlib.sha256(data).hexdigest())))
+            else:
+                sibs.append(_VSibling(name, len(data), blob_id=_git_blob_sha1_bytes(data)))
+        return _Info(sibs)
+
+
+def files_downloader_factory(files):
+    def _download(*, local_dir, stop=None, **_):
+        target = Path(local_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        for name, data in files.items():
+            (target / name).write_bytes(data)
+    return _download
+
+
+def _write_completed_repo(store, settings, slug, files):
+    """Create a completed job with `files` already on disk and total_bytes set —
+    the precondition for a manual verify."""
+    job = store.create_job(slug, "model")
+    d = local_dir_for(settings.backup_dir, "model", slug)
+    d.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        (d / name).write_bytes(data)
+    store.set_status(job.id, COMPLETED)
+    store.update_progress(job.id, 0, total_bytes=sum(len(b) for b in files.values()))
+    return job
+
+
+def make_settings(tmp_path, max_jobs=2, verify_downloads=False):
     return Settings(
         hf_token="hf_test",
         backup_dir=tmp_path / "backups",
         max_concurrent_jobs=max_jobs,
         max_workers=4,
         db_path=tmp_path / "jobs.db",
+        verify_downloads=verify_downloads,
     )
 
 
@@ -597,4 +655,105 @@ def test_worker_requeues_when_valve_closes_during_preflight(tmp_path):
     j = store.get_job(job.id)
     assert j.status == QUEUED                     # requeued, not completed
     assert (tmp_path / "backups" / "models" / "o" / "n" / "partial.bin").exists()
+    store.close()
+
+
+def test_worker_auto_verifies_after_download(tmp_path):
+    settings = make_settings(tmp_path, verify_downloads=True)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    files = {"config.json": b'{"a":1}', "model.bin": b"WEIGHTS-DATA"}
+    run_backup_job(job.id, store, settings, api=VerifyApi(files),
+                   launcher=InThreadLauncher(files_downloader_factory(files)),
+                   registry=RunningRegistry())
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED
+    assert j.verify_status == "verified"
+    assert j.verify_detail is None
+    assert j.downloaded_bytes == j.total_bytes        # bar restored to 100%
+    store.close()
+
+
+def test_worker_auto_verify_detects_corruption(tmp_path):
+    settings = make_settings(tmp_path, verify_downloads=True)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    truth = {"model.bin": b"GOOD-WEIGHTS"}            # what the Hub reports
+    bad = {"model.bin": b"BADX-WEIGHTS"}              # what the downloader writes (same length)
+    run_backup_job(job.id, store, settings, api=VerifyApi(truth),
+                   launcher=InThreadLauncher(files_downloader_factory(bad)),
+                   registry=RunningRegistry())
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED
+    assert j.verify_status == "corrupted"
+    assert json.loads(j.verify_detail)["failures"] == [{"file": "model.bin", "reason": "mismatch"}]
+    store.close()
+
+
+def test_worker_skips_verify_when_disabled(tmp_path):
+    settings = make_settings(tmp_path, verify_downloads=False)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    files = {"model.bin": b"WEIGHTS"}
+    run_backup_job(job.id, store, settings, api=VerifyApi(files),
+                   launcher=InThreadLauncher(files_downloader_factory(files)),
+                   registry=RunningRegistry())
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED
+    assert j.verify_status == "unverified"            # never verified
+    store.close()
+
+
+def test_run_verify_job_marks_verified(tmp_path):
+    settings = make_settings(tmp_path, verify_downloads=True)
+    store = JobStore(settings.db_path)
+    files = {"config.json": b'{"a":1}', "model.bin": b"WEIGHTS"}
+    job = _write_completed_repo(store, settings, "o/n", files)
+    run_verify_job(job.id, store, settings, api=VerifyApi(files), registry=RunningRegistry())
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED and j.verify_status == "verified"
+    store.close()
+
+
+def test_run_verify_job_marks_corrupted(tmp_path):
+    settings = make_settings(tmp_path, verify_downloads=True)
+    store = JobStore(settings.db_path)
+    truth = {"model.bin": b"GOOD-WEIGHTS"}
+    job = _write_completed_repo(store, settings, "o/n", {"model.bin": b"BADX-WEIGHTS"})
+    run_verify_job(job.id, store, settings, api=VerifyApi(truth), registry=RunningRegistry())
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED and j.verify_status == "corrupted"
+    store.close()
+
+
+def test_verify_marks_unverifiable_when_hub_unreachable(tmp_path):
+    settings = make_settings(tmp_path, verify_downloads=True)
+    store = JobStore(settings.db_path)
+    job = _write_completed_repo(store, settings, "o/n", {"model.bin": b"WEIGHTS"})
+
+    class FailApi:
+        def repo_info(self, *a, **k):
+            raise RuntimeError("hub down")
+
+    run_verify_job(job.id, store, settings, api=FailApi(), registry=RunningRegistry())
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED
+    assert j.verify_status == "unverified"            # cannot-verify != corrupted
+    assert "could not reach" in json.loads(j.verify_detail)["note"]
+    assert j.downloaded_bytes == j.total_bytes        # bar restored
+    store.close()
+
+
+def test_verify_aborts_on_preset_stop_intent(tmp_path):
+    settings = make_settings(tmp_path, verify_downloads=True)
+    store = JobStore(settings.db_path)
+    files = {"model.bin": b"WEIGHTS"}
+    job = _write_completed_repo(store, settings, "o/n", files)
+    registry = RunningRegistry()
+    registry._intents[job.id] = "stop_verify"          # stop requested before registration
+    run_verify_job(job.id, store, settings, api=VerifyApi(files), registry=registry)
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED
+    assert j.verify_status == "unverified"             # interrupted -> inconclusive
+    assert j.downloaded_bytes == j.total_bytes
     store.close()

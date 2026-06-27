@@ -67,3 +67,13 @@ def test_global_pause_and_retrying_ui_present(client):
     assert "resume-all" in page         # global resume endpoint wired
     assert ".st.retrying" in page       # retrying status color rule
     assert "retryText" in page          # helper that renders "N/5 · next in …"
+
+
+def test_verify_ui_present(client):
+    page = client.get("/").text
+    assert "verifyBadge" in page          # verified / corrupted / unverified badge helper
+    assert "confirmRedownload" in page    # corrupted -> re-download control
+    assert "stop-verify" in page          # stop an in-progress verification
+    assert "/verify" in page or "'verify'" in page  # manual verify wired
+    assert ".st.verifying" in page        # verifying status color rule
+    assert ".vbadge" in page              # verify badge style
