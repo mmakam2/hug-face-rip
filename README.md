@@ -1,4 +1,4 @@
-# HF Repo Backup Dashboard
+# Hugging Face Rip
 
 A small FastAPI web app that backs up entire Hugging Face Hub repositories
 (models, datasets, spaces) to a local folder — with bounded concurrency,
@@ -75,14 +75,14 @@ space, after a confirmation).
 
 ## Run as a service (systemd)
 
-A unit file is provided at [`deploy/hf-backup.service`](deploy/hf-backup.service)
+A unit file is provided at [`deploy/hug-face-rip.service`](deploy/hug-face-rip.service)
 (paths assume the app lives at `/root/hug-face-rip`). Install it with:
 
 ```bash
-sudo cp deploy/hf-backup.service /etc/systemd/system/
+sudo cp deploy/hug-face-rip.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now hf-backup.service
-sudo systemctl status hf-backup.service
+sudo systemctl enable --now hug-face-rip.service
+sudo systemctl status hug-face-rip.service
 ```
 
 It restarts on failure and, because the app re-queues unfinished jobs on
@@ -93,10 +93,10 @@ and `MemoryMax=`), **not** in `.env` — `.env` values do not override variables
 systemd already set. Follow the logs, and apply config or code changes, with:
 
 ```bash
-journalctl -u hf-backup -f                            # follow the logs
-sudo cp deploy/hf-backup.service /etc/systemd/system/ # only if you edited the unit
+journalctl -u hug-face-rip -f                            # follow the logs
+sudo cp deploy/hug-face-rip.service /etc/systemd/system/ # only if you edited the unit
 sudo systemctl daemon-reload                          # only after editing the unit
-sudo systemctl restart hf-backup                      # picks up new env + working-tree code
+sudo systemctl restart hug-face-rip                      # picks up new env + working-tree code
 ```
 
 `Environment=` and `MemoryMax=` changes take effect only on restart. The service

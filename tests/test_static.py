@@ -29,7 +29,7 @@ def client(tmp_path):
 def test_index_served(client):
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "Hugging Face Repo Backup" in resp.text
+    assert "Hugging Face Rip" in resp.text
     assert "/api/jobs" in resp.text  # JS talks to the API
 
 

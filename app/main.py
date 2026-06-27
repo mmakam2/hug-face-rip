@@ -28,7 +28,7 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
             runner.submit(job.id)
         yield
 
-    app = FastAPI(title="HF Repo Backup", lifespan=lifespan)
+    app = FastAPI(title="Hugging Face Rip", lifespan=lifespan)
 
     @app.get("/")
     def index():

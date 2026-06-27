@@ -72,12 +72,12 @@ Request/data flow across the four modules:
 
 ## Deployment (systemd) & the Xet memory gotcha
 
-Runs as the systemd unit **`hf-backup`**. The repo copy `deploy/hf-backup.service` is the source of
+Runs as the systemd unit **`hug-face-rip`**. The repo copy `deploy/hug-face-rip.service` is the source of
 truth; it is **installed to `/etc/systemd/system/`**. To change service config:
 
 ```bash
-sudo cp deploy/hf-backup.service /etc/systemd/system/ && sudo systemctl daemon-reload \
-  && sudo systemctl restart hf-backup
+sudo cp deploy/hug-face-rip.service /etc/systemd/system/ && sudo systemctl daemon-reload \
+  && sudo systemctl restart hug-face-rip
 ```
 
 `Environment=` vars and `MemoryMax` only take effect **on restart** — the running process keeps its
