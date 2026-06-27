@@ -3,9 +3,12 @@ Description=Hugging Face Rip
 Documentation=file:///root/hug-face-rip/README.md
 After=network-online.target
 Wants=network-online.target
-# Don't crash-loop: give up after 2 starts in 5 min, then stay failed.
+# Don't crash-loop: cap (re)starts at 5 in 5 min, then stay failed. A genuine
+# crash loop (Restart=on-failure + RestartSec=3) still trips this in ~15s, while
+# a few manual restarts during ops no longer wedge the unit. If you do trip it,
+# clear with: systemctl reset-failed hug-face-rip
 StartLimitIntervalSec=300
-StartLimitBurst=2
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -30,7 +33,7 @@ ExecStart=/root/hug-face-rip/.venv/bin/python -m app.main
 # wedges it in reclaim; the hard cap alone is the right tool here.
 MemoryAccounting=yes
 MemoryMax=8G
-# Restart only on failure; StartLimitBurst above caps it at 2 tries / 5 min so a
+# Restart only on failure; StartLimitBurst above caps it at 5 tries / 5 min so a
 # crashing job can't loop. The app re-queues unfinished jobs on startup, so an
 # interrupted download resumes automatically when it does restart.
 Restart=on-failure

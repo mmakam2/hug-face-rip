@@ -8,9 +8,13 @@ from app.main import create_app
 class FakeRunner:
     def __init__(self):
         self.submitted = []
+        self.shutdowns = 0
 
     def submit(self, job_id):
         self.submitted.append(job_id)
+
+    def shutdown(self, wait=False):
+        self.shutdowns += 1
 
 
 def make_settings(tmp_path):
@@ -246,4 +250,19 @@ def test_startup_resumes_unfinished_jobs(tmp_path):
     with TestClient(app):  # triggers startup
         pass
     assert leftover.id in runner.submitted
+    store.close()
+
+
+def test_lifespan_shuts_down_runner_on_exit(tmp_path):
+    # On shutdown the lifespan must call runner.shutdown() so in-flight/queued
+    # jobs are left resumable instead of crashing into 'failed' during teardown.
+    settings = make_settings(tmp_path)
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(settings.db_path)
+    runner = FakeRunner()
+    app = create_app(settings, store, runner, detect=lambda s, t: [])
+    with TestClient(app):  # triggers startup
+        pass
+    # exiting the context triggers lifespan shutdown
+    assert runner.shutdowns == 1
     store.close()

@@ -70,6 +70,42 @@ const fmt = b => {
   return (b / Math.pow(1024, i)).toFixed(i ? 1 : 0) + " " + u[i];
 };
 const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+// --- aggregate download speed (client-side, display-only) ---
+let lastSample = null;     // { at: <ms>, bytes: Map<jobId, downloaded_bytes> }
+let smoothedSpeed = null;  // EMA of bytes/sec across running jobs, or null when idle
+
+// Pure: instantaneous aggregate rate (bytes/sec) + the new sample. Sums only
+// positive per-job deltas for jobs running in BOTH samples, so a completed or
+// deleted job (drops out), a newly started/resumed job (no prior entry), and
+// Xet staging re-counts (negative blip) never produce a spurious spike.
+function computeSpeed(prevSample, jobs, now) {
+  const bytes = new Map();
+  for (const j of jobs) {
+    if (j.status === "running") bytes.set(j.id, j.downloaded_bytes || 0);
+  }
+  const sample = { at: now, bytes };
+  if (!prevSample || now <= prevSample.at) return { speed: null, sample };
+  const elapsed = (now - prevSample.at) / 1000;
+  let delta = 0;
+  for (const [id, cur] of bytes) {
+    const prev = prevSample.bytes.get(id);
+    if (prev !== undefined) delta += Math.max(0, cur - prev);
+  }
+  return { speed: delta / elapsed, sample };
+}
+
+// Update state from the latest jobs list; return the smoothed rate to display,
+// or null when nothing is downloading / not enough data yet.
+function updateSpeed(jobs) {
+  const running = jobs.some(j => j.status === "running");
+  const { speed, sample } = computeSpeed(lastSample, jobs, Date.now());
+  lastSample = sample;
+  if (!running) { smoothedSpeed = null; lastSample = null; return null; }   // idle -> fully reset, start fresh next run
+  if (speed === null) return smoothedSpeed;              // first sample of this run (stays null)
+  smoothedSpeed = smoothedSpeed === null ? speed : 0.3 * speed + 0.7 * smoothedSpeed;
+  return smoothedSpeed;
+}
+
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) {
@@ -114,7 +150,7 @@ function row(j) {
     <td class="size">${fmt(j.downloaded_bytes)} / ${fmt(j.total_bytes)}</td>
     <td>${actions}</td></tr>`;
 }
-async function loadStorage() {
+async function loadStorage(speed) {
   try {
     const s = await api("/api/storage");
     const total = s.total || 0;
@@ -127,20 +163,25 @@ async function loadStorage() {
     const plannedTxt = planned
       ? ` · <span style="color:${over ? "var(--err)" : "var(--ok)"}">+${fmt(planned)} planned${over ? ` · ⚠ ${fmt(s.used + planned - total)} over` : ""}</span>`
       : "";
+    const speedTxt = speed != null
+      ? ` · <span style="color:var(--accent)">↓ ${fmt(Math.round(speed))}/s</span>`
+      : "";
     el.innerHTML =
       `<div class="slabel">Backup disk<span class="spath">${esc(s.path)}</span></div>` +
       `<div class="sbar"><span class="sused" style="width:${usedPct}%"></span><span class="splanned${over ? " over" : ""}" style="width:${plannedPct}%"></span></div>` +
-      `<div class="sval"><b>${fmt(s.used)}</b> / ${fmt(s.total)} used · ${fmt(s.free)} free${plannedTxt}</div>`;
+      `<div class="sval"><b>${fmt(s.used)}</b> / ${fmt(s.total)} used · ${fmt(s.free)} free${plannedTxt}${speedTxt}</div>`;
     el.hidden = false;
   } catch (e) { /* transient; keep polling */ }
 }
 async function refresh() {
-  loadStorage();
+  let speed = null;
   try {
     const { jobs } = await api("/api/jobs");
+    speed = updateSpeed(jobs);
     document.getElementById("rows").innerHTML = jobs.map(row).join("");
     document.getElementById("empty").style.display = jobs.length ? "none" : "block";
   } catch (e) { /* transient; keep polling */ }
+  loadStorage(speed);
 }
 refresh();
 setInterval(refresh, 1500);

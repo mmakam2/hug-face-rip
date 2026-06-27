@@ -85,7 +85,7 @@ def free_disk_bytes(path) -> int:
 POLL_INTERVAL = 1.5
 
 
-def run_backup_job(job_id, store, settings, api=None, downloader=None) -> None:
+def run_backup_job(job_id, store, settings, api=None, downloader=None, stopping=None) -> None:
     if downloader is None:
         from huggingface_hub import snapshot_download
         downloader = snapshot_download
@@ -141,6 +141,12 @@ def run_backup_job(job_id, store, settings, api=None, downloader=None) -> None:
         stop.set()
         if poller.is_alive():
             poller.join(timeout=2)
+        # If the process is shutting down, snapshot_download's thread pool raises
+        # "cannot schedule new futures after interpreter shutdown". That is not a
+        # real download failure — leave the job in its current ('running') state so
+        # the startup re-queue resumes it instead of marking it permanently failed.
+        if stopping is not None and stopping.is_set():
+            return
         store.set_status(job_id, "failed", error=str(exc)[:500])
 
 
@@ -150,12 +156,20 @@ class JobRunner:
         self._settings = settings
         self._api = api
         self._downloader = downloader
+        self._stopping = threading.Event()
         self._executor = ThreadPoolExecutor(max_workers=settings.max_concurrent_jobs)
 
     def submit(self, job_id) -> None:
         self._executor.submit(
-            run_backup_job, job_id, self._store, self._settings, self._api, self._downloader
+            run_backup_job, job_id, self._store, self._settings,
+            self._api, self._downloader, self._stopping,
         )
 
-    def shutdown(self) -> None:
-        self._executor.shutdown(wait=True)
+    def shutdown(self, wait: bool = False) -> None:
+        """Stop the runner. Default (wait=False) is for process shutdown: signal
+        in-flight workers that we're stopping (so they leave their jobs resumable)
+        and cancel not-yet-started jobs (which stay 'queued' for the next startup
+        to resume) without blocking on the in-flight download. wait=True drains
+        every job to completion instead."""
+        self._stopping.set()
+        self._executor.shutdown(wait=wait, cancel_futures=not wait)
