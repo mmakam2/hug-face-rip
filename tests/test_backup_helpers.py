@@ -70,5 +70,17 @@ def test_directory_size_counts_files_excluding_cache(tmp_path):
     assert directory_size(tmp_path) == 15
 
 
+def test_directory_size_counts_incomplete_staging_under_cache(tmp_path):
+    # Xet stages in-flight downloads as .cache/huggingface/download/*.incomplete;
+    # those bytes are really on disk and must count toward progress.
+    (tmp_path / "done.safetensors").write_bytes(b"x" * 10)
+    download = tmp_path / ".cache" / "huggingface" / "download"
+    download.mkdir(parents=True)
+    (download / "abc.incomplete").write_bytes(b"y" * 7)
+    # non-staging .cache cruft (metadata, locks) stays excluded
+    (download / "abc.metadata").write_bytes(b"z" * 1000)
+    assert directory_size(tmp_path) == 17  # 10 completed + 7 in-flight
+
+
 def test_directory_size_missing_path_is_zero(tmp_path):
     assert directory_size(tmp_path / "nope") == 0
