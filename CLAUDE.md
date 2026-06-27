@@ -38,39 +38,55 @@ The app is built around **dependency injection so tests never hit the network**.
 `detect`); `build_default_app()` is the only place that wires the real `HfApi` /
 `snapshot_download`. Tests pass fakes — that's why the default suite runs offline.
 
-Request/data flow across the four modules:
+Request/data flow across the modules:
 
 - **`config.py`** — `load_settings()` reads env into a frozen `Settings` dataclass; validates the
-  token, creates/writes-checks `BACKUP_DIR`, raises `ConfigError` on bad input.
+  token, creates/writes-checks `BACKUP_DIR`, raises `ConfigError` on bad input. `verify_downloads`
+  (env `VERIFY_DOWNLOADS`, default on) gates the automatic post-download integrity check.
 - **`db.py`** — `JobStore` wraps **one** SQLite connection shared across threads (a `threading.Lock`
   guards every call; `check_same_thread=False`). `Job` has a computed `percent`. Status lifecycle:
-  `queued → running → completed | failed | paused | retrying`. A **transient** failure (DNS,
+  `queued → running → verifying → completed | failed | paused | retrying`. A **transient** failure (DNS,
   connection drop, timeout, 5xx/429 — classified by `app/retry.py` against httpx) auto-retries up
   to 5× with backoff `30s/60s/2m/4m/8m` (status `retrying`, `next_retry_at`); **permanent** errors
-  (404/gated/bad slug/disk-full) go straight to `failed`. Paused jobs are excluded from startup
-  re-queuing and resumed manually. Cancelling removes the row for queued/paused/retrying jobs and
-  also terminates the child process for running ones, discarding files. `__init__` **migrates a
-  pre-existing `jobs` table** (adds `retry_count`/`next_retry_at`) and seeds the `app_state` table,
-  which holds the persistent global Pause/Play **valve** (`paused_all`). `UNIQUE(repo_type, slug)`
-  means one row per repo+type.
+  (404/gated/bad slug/disk-full) go straight to `failed`. The transient `verifying` status (entered
+  after a successful download or via the manual Verify button) counts toward a concurrency slot;
+  the verification **outcome** lives in `verify_status` (`unverified | verified | corrupted`) and
+  `verify_detail` (JSON: `{"failures":[…]}` when corrupted, `{"note":…}` when the Hub was
+  unreachable). Paused jobs are excluded from startup re-queuing and resumed manually. Cancelling
+  removes the row for queued/paused/retrying jobs and also terminates the child process for running
+  ones, discarding files. `__init__` **migrates a pre-existing `jobs` table** (adds
+  `retry_count`/`next_retry_at`, then `verify_status`/`verify_detail`) and seeds the `app_state`
+  table, which holds the persistent global Pause/Play **valve** (`paused_all`).
+  `reset_verifying_to_completed()` rescues a job orphaned mid-verification on startup (→
+  `completed`/`unverified`, bar restored). `UNIQUE(repo_type, slug)` means one row per repo+type.
 - **`backup.py`** — the worker engine. A **central dispatcher** loop (`JobRunner.start()`) is the
   only thing that starts downloads: while the valve is open and a slot is free (`running_count <
-  max_concurrent_jobs`) it claims the lowest-id eligible job (`queued`, or `retrying` whose backoff
-  elapsed) and submits it to a `ThreadPoolExecutor`. Endpoints/lifespan only write DB state.
-  `run_backup_job()` handles **one** repo: size it, run a **pre-flight disk-space check**, then run
-  `snapshot_download(..., max_workers=max_workers)` in a **terminable child process**
-  (`app/launcher.py`, `SubprocessLauncher`, spawn) so it can be paused/cancelled near-instantly even
-  mid-file. A `RunningRegistry` maps `job_id → handle`+intent (`pause`/`cancel`/`requeue`); the
-  worker performs the single terminal transition (`completed`/`paused`/`failed`/`retrying`, delete,
-  or requeue) after the child exits. Global pause (`pause_all`) closes the valve and requeues every
-  running job; `resume_all` reopens it.
+  max_concurrent_jobs`, counting `running` + `verifying`) it claims the lowest-id eligible job
+  (`queued`, or `retrying` whose backoff elapsed) and submits it to a `ThreadPoolExecutor`.
+  Endpoints/lifespan only write DB state. `run_backup_job()` handles **one** repo: size it, run a
+  **pre-flight disk-space check**, then run `snapshot_download(..., max_workers=max_workers)` in a
+  **terminable child process** (`app/launcher.py`, `SubprocessLauncher`, spawn) so it can be
+  paused/cancelled near-instantly even mid-file. A `RunningRegistry` maps `job_id → handle`+intent
+  (`pause`/`cancel`/`requeue`/`stop_verify`); the worker performs the single terminal transition
+  after the child exits. After a successful download (when `verify_downloads`) the worker runs
+  `_verify_phase`, which hashes every file via `app/verify.py` **cooperatively in-thread** (a stop
+  `Event` checked between chunks, registered in `RunningRegistry` like a download — no subprocess)
+  and records `verified`/`corrupted`. `JobRunner.verify` runs the same `run_verify_job` on demand
+  for a completed job. **Interrupting a verify (Stop, pause-all, shutdown) always returns the job to
+  `completed`/`unverified` — never deletes or requeues** (its download is already complete). Global
+  pause (`pause_all`) closes the valve and requeues every running download; `resume_all` reopens it.
+- **`verify.py`** — the pure, offline-testable hash core: `sha256_file`, `git_blob_sha1`,
+  `expected_file_hashes` (maps repo siblings to per-file algo+hash), and
+  `verify_repo(local_dir, expected, stop, on_progress) → VerifyReport`. LFS files verify by SHA256,
+  plain git files by git blob SHA1.
 - **`main.py`** — HTTP API + serves the `static/` dashboard. The FastAPI **lifespan hook resets
-  orphaned `running` jobs to `queued` and starts the dispatcher** (the auto-resume mechanism, valve
-  permitting). Endpoints: `POST/GET /api/jobs`, `GET /api/storage` (includes `planned` and
-  `paused_all`), `POST /api/jobs/{id}/retry|pause|resume|cancel|delete`, and `POST
+  orphaned `running` jobs to `queued`** and **orphaned `verifying` jobs to `completed`**, then starts
+  the dispatcher (the auto-resume mechanism, valve permitting). Endpoints: `POST/GET /api/jobs`,
+  `GET /api/storage` (includes `planned` and `paused_all`), `POST
+  /api/jobs/{id}/retry|pause|resume|cancel|delete|verify|stop-verify|redownload`, and `POST
   /api/pause-all|resume-all` (the global valve).
 
-### Two things that are easy to get wrong
+### Things that are easy to get wrong
 
 1. **Progress is measured from disk, not the downloader.** A daemon poller thread samples
    `directory_size(local_dir)` every `POLL_INTERVAL` (1.5s) and writes it to the DB. The download
@@ -81,6 +97,12 @@ Request/data flow across the four modules:
 
 2. **`MAX_CONCURRENT_JOBS` × `MAX_WORKERS` multiply into memory pressure** (repos-in-parallel ×
    files-per-repo). Both are the dials for the speed/RAM tradeoff.
+
+3. **Integrity uses two hash algorithms.** The Hub reports SHA256 only for LFS-tracked files
+   (`sibling.lfs.sha256`); plain git files carry only a git blob OID (`sibling.blob_id`, a SHA1 over
+   `"blob <len>\0" + bytes`), so `verify_repo` checks each with the right one. And **cannot-verify ≠
+   corrupted**: if the Hub lookup for reference hashes fails, the job stays `completed`/`unverified`
+   with a note — it is never marked `corrupted` on a network error.
 
 ## Deployment (systemd) & the Xet memory gotcha
 
