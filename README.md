@@ -66,7 +66,9 @@ server resumes any in-flight backups automatically.
 
 Each row shows live progress, and a disk-usage bar shows current usage plus
 *planned* usage from queued and in-flight jobs (so you can see whether what's
-queued will fit). You can **retry** a failed backup, **cancel** a queued one, or
+queued will fit). While downloads are running it also shows the **aggregate
+download speed** across all active jobs. You can **retry** a failed backup,
+**cancel** a queued one, or
 **delete** a completed one (which removes its downloaded files and frees the
 space, after a confirmation).
 
