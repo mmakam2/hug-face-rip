@@ -86,27 +86,35 @@ def test_directory_size_missing_path_is_zero(tmp_path):
     assert directory_size(tmp_path / "nope") == 0
 
 
-def test_directory_size_survives_file_vanishing_mid_walk(tmp_path):
-    # Simulates the race between the daemon poller and cancel's rmtree: a file
-    # disappears between rglob() yielding it and stat() reading its size.
-    # directory_size must return the sum of survivors without raising.
+def test_directory_size_survives_file_vanishing_between_is_file_and_stat(tmp_path):
+    # The real poller-vs-cancel race: a file passes is_file() (still present),
+    # then the cancel path's rmtree removes it before directory_size reads its
+    # size, so item.stat().st_size raises FileNotFoundError mid-walk. Without the
+    # OSError guard in directory_size this propagates and crashes the daemon
+    # poller; with it, the vanished file is skipped and survivors are still summed.
+    import unittest.mock as _mock
+    from pathlib import Path
+
     (tmp_path / "a.bin").write_bytes(b"x" * 20)
     (tmp_path / "b.bin").write_bytes(b"y" * 5)
-    vanishing = tmp_path / "c.bin"
-    vanishing.write_bytes(b"z" * 999)
-    vanishing.unlink()   # gone before directory_size walks it (simulates mid-walk deletion)
-    # Only a.bin and b.bin remain; c.bin was never actually walked because it's
-    # already gone, but what matters is that any OSError on stat() is swallowed.
-    # Monkeypatch stat on Path to simulate a survivor that raises mid-walk:
-    real_stat = vanishing.__class__.stat
-    def _patched_stat(self, **kw):
+
+    real_stat = Path.stat
+    stat_calls = {}
+
+    def flaky_stat(self, *args, **kwargs):
         if self.name == "b.bin":
-            raise FileNotFoundError(f"[Errno 2] No such file: '{self}'")
-        return real_stat(self, **kw)
-    import unittest.mock as _mock
-    with _mock.patch.object(tmp_path.__class__, "stat", _patched_stat):
+            # 1st stat call is is_file()'s (let it pass so the file looks present);
+            # 2nd is the st_size read — raise, simulating the file vanishing in
+            # exactly that window.
+            stat_calls["b"] = stat_calls.get("b", 0) + 1
+            if stat_calls["b"] >= 2:
+                raise FileNotFoundError(f"[Errno 2] No such file: '{self}'")
+        return real_stat(self, *args, **kwargs)
+
+    with _mock.patch.object(Path, "stat", flaky_stat):
         result = directory_size(tmp_path)
-    assert result == 20   # only a.bin counted; b.bin raised OSError, c.bin was already gone
+
+    assert result == 20   # b.bin vanished before its size was read; only a.bin counted
 
 
 def test_delete_backup_files_removes_dir_within_backup(tmp_path):
