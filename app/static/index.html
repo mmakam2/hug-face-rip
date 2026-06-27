@@ -100,11 +100,12 @@ function updateSpeed(jobs) {
   const running = jobs.some(j => j.status === "running");
   const { speed, sample } = computeSpeed(lastSample, jobs, Date.now());
   lastSample = sample;
-  if (!running) { smoothedSpeed = null; return null; }   // idle -> reset, start fresh next run
+  if (!running) { smoothedSpeed = null; lastSample = null; return null; }   // idle -> fully reset, start fresh next run
   if (speed === null) return smoothedSpeed;              // first sample of this run (stays null)
   smoothedSpeed = smoothedSpeed === null ? speed : 0.3 * speed + 0.7 * smoothedSpeed;
   return smoothedSpeed;
 }
+
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) {
