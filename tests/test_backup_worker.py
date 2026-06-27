@@ -247,10 +247,11 @@ def test_runner_runs_job_to_completion(tmp_path):
     store = JobStore(settings.db_path)
     job = store.create_job("o/n", "model")
     runner = JobRunner(store, settings, api=FakeApi(11),
-                       launcher=InThreadLauncher(fake_downloader_factory(b"y" * 11)))
-    runner.submit(job.id)
-    runner.shutdown(wait=True)  # drain: waits for completion
-    assert store.get_job(job.id).status == COMPLETED
+                       launcher=InThreadLauncher(fake_downloader_factory(b"y" * 11)),
+                       dispatch_interval=0.02)
+    runner.start()              # the dispatcher claims and runs the queued job
+    assert wait_until(lambda: store.get_job(job.id).status == COMPLETED, timeout=5)
+    runner.shutdown()
     store.close()
 
 
@@ -372,8 +373,9 @@ def test_runner_pause_sets_job_paused(tmp_path):
     job = store.create_job("o/n", "model")
     started = threading.Event()
     runner = JobRunner(store, settings, api=FakeApi(1000),
-                       launcher=InThreadLauncher(blocking_downloader_factory(started)))
-    runner.submit(job.id)
+                       launcher=InThreadLauncher(blocking_downloader_factory(started)),
+                       dispatch_interval=0.02)
+    runner.start()
     assert started.wait(3)
     runner.pause(job.id)
     assert wait_until(lambda: store.get_job(job.id).status == PAUSED)
@@ -425,8 +427,9 @@ def test_runner_cancel_terminates_and_removes_job(tmp_path):
     job = store.create_job("o/n", "model")
     started = threading.Event()
     runner = JobRunner(store, settings, api=FakeApi(1000),
-                       launcher=InThreadLauncher(blocking_downloader_factory(started)))
-    runner.submit(job.id)
+                       launcher=InThreadLauncher(blocking_downloader_factory(started)),
+                       dispatch_interval=0.02)
+    runner.start()
     assert started.wait(3)
     assert runner.cancel(job.id) is True
     assert wait_until(lambda: store.get_job(job.id) is None)
@@ -508,4 +511,70 @@ def test_worker_preflight_disk_failure_is_permanent(tmp_path, monkeypatch):
                    launcher=InThreadLauncher(fake_downloader_factory(b"x")), registry=None)
     j = store.get_job(job.id)
     assert j.status == FAILED and j.retry_count == 0   # disk-full is not retried
+    store.close()
+
+
+def test_dispatcher_runs_queued_jobs_in_priority_order(tmp_path):
+    settings = make_settings(tmp_path, max_jobs=1)
+    store = JobStore(settings.db_path)
+    a = store.create_job("a/b", "model")
+    b = store.create_job("c/d", "model")
+    runner = JobRunner(store, settings, api=FakeApi(5),
+                       launcher=InThreadLauncher(fake_downloader_factory(b"x" * 5)),
+                       dispatch_interval=0.02)
+    runner.start()
+    assert wait_until(lambda: store.get_job(a.id).status == COMPLETED
+                      and store.get_job(b.id).status == COMPLETED, timeout=5)
+    runner.shutdown()
+    store.close()
+
+
+def test_dispatcher_respects_closed_valve(tmp_path):
+    settings = make_settings(tmp_path, max_jobs=2)
+    store = JobStore(settings.db_path)
+    job = store.create_job("a/b", "model")
+    store.set_flag("paused_all", "1")                 # valve closed before start
+    runner = JobRunner(store, settings, api=FakeApi(5),
+                       launcher=InThreadLauncher(fake_downloader_factory(b"x" * 5)),
+                       dispatch_interval=0.02)
+    runner.start()
+    assert not wait_until(lambda: store.get_job(job.id).status == COMPLETED, timeout=1)
+    assert store.get_job(job.id).status == QUEUED     # held while paused
+    runner.resume_all()
+    assert wait_until(lambda: store.get_job(job.id).status == COMPLETED, timeout=5)
+    runner.shutdown()
+    store.close()
+
+
+def test_dispatcher_honors_concurrency_cap(tmp_path):
+    settings = make_settings(tmp_path, max_jobs=1)
+    store = JobStore(settings.db_path)
+    store.create_job("a/b", "model")
+    store.create_job("c/d", "model")
+    started = threading.Event()
+    runner = JobRunner(store, settings, api=FakeApi(1000),
+                       launcher=InThreadLauncher(blocking_downloader_factory(started)),
+                       dispatch_interval=0.02)
+    runner.start()
+    assert started.wait(3)
+    time.sleep(0.3)                                   # give the loop time to (not) over-dispatch
+    assert store.running_count() == 1                 # cap of 1 honored
+    runner.shutdown()
+    store.close()
+
+
+def test_pause_all_requeues_running_and_sets_flag(tmp_path):
+    settings = make_settings(tmp_path, max_jobs=2)
+    store = JobStore(settings.db_path)
+    job = store.create_job("a/b", "model")
+    started = threading.Event()
+    runner = JobRunner(store, settings, api=FakeApi(1000),
+                       launcher=InThreadLauncher(blocking_downloader_factory(started)),
+                       dispatch_interval=0.02)
+    runner.start()
+    assert started.wait(3)
+    runner.pause_all()
+    assert store.get_flag("paused_all", "0") == "1"
+    assert wait_until(lambda: store.get_job(job.id).status == QUEUED, timeout=5)
+    runner.shutdown()
     store.close()

@@ -138,6 +138,15 @@ class RunningRegistry:
         for handle in handles:
             handle.terminate()
 
+    def request_all(self, intent) -> None:
+        """Record an intent for every running job and terminate each handle."""
+        with self._lock:
+            items = list(self._handles.items())
+            for job_id, _ in items:
+                self._intents[job_id] = intent
+        for _, handle in items:
+            handle.terminate()
+
 
 def _record_failure(store, job_id, retry_count, message, retryable) -> None:
     """Either schedule an auto-retry (transient + budget remaining) or mark the
@@ -246,17 +255,46 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
             registry.unregister(job_id)
 
 
+DISPATCH_INTERVAL = 1.0
+
+
 class JobRunner:
-    def __init__(self, store, settings, api=None, launcher=None) -> None:
+    def __init__(self, store, settings, api=None, launcher=None,
+                 dispatch_interval: float = DISPATCH_INTERVAL) -> None:
         self._store = store
         self._settings = settings
         self._api = api
         self._launcher = launcher
+        self._interval = dispatch_interval
         self._stopping = threading.Event()
         self._registry = RunningRegistry()
         self._executor = ThreadPoolExecutor(max_workers=settings.max_concurrent_jobs)
+        self._dispatcher = None
 
-    def submit(self, job_id) -> None:
+    def start(self) -> None:
+        """Start the dispatcher daemon (idempotent). It is the only thing that
+        starts downloads: while the valve is open and a slot is free it claims and
+        runs the lowest-id eligible job."""
+        if self._dispatcher is not None:
+            return
+        self._dispatcher = threading.Thread(target=self._dispatch_loop, daemon=True)
+        self._dispatcher.start()
+
+    def _dispatch_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                if self._store.get_flag("paused_all", "0") != "1":   # valve open
+                    while self._store.running_count() < self._settings.max_concurrent_jobs:
+                        job = self._store.next_runnable_job()
+                        if job is None:
+                            break
+                        if self._store.claim(job.id):
+                            self._submit(job.id)
+            except Exception:  # noqa: BLE001 - the loop must never die
+                pass
+            self._stopping.wait(self._interval)
+
+    def _submit(self, job_id) -> None:
         self._executor.submit(
             run_backup_job, job_id, self._store, self._settings,
             self._api, self._launcher, self._stopping, self._registry,
@@ -271,11 +309,23 @@ class JobRunner:
         child dies. Returns True if a live download was terminated."""
         return self._registry.request(job_id, "cancel")
 
+    def pause_all(self) -> None:
+        """Close the global valve and return every running download to 'queued'
+        (keeping files). Per-job 'paused' jobs are untouched."""
+        self._store.set_flag("paused_all", "1")
+        self._registry.request_all("requeue")
+
+    def resume_all(self) -> None:
+        """Open the global valve; the dispatcher resumes held work by priority."""
+        self._store.set_flag("paused_all", "0")
+
     def shutdown(self, wait: bool = False) -> None:
-        """Stop the runner. Default (wait=False) is for process shutdown: signal
-        in-flight workers that we're stopping (so they leave their jobs resumable),
-        terminate their child processes, and cancel not-yet-started jobs (which
-        stay 'queued' for the next startup). wait=True drains to completion."""
+        """Stop the dispatcher and runner. Default (wait=False) is for process
+        shutdown: signal in-flight workers (so they leave jobs resumable),
+        terminate their child processes, and stop accepting new work. wait=True
+        drains running jobs to completion."""
         self._stopping.set()
+        if self._dispatcher is not None:
+            self._dispatcher.join(timeout=2)
         self._registry.terminate_all()
         self._executor.shutdown(wait=wait, cancel_futures=not wait)
