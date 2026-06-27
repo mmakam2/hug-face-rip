@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -64,6 +65,16 @@ def create_app(settings, store, runner, detect=detect_repo_types) -> FastAPI:
     @app.get("/api/jobs")
     def list_jobs():
         return {"jobs": [job.to_dict() for job in store.list_jobs()]}
+
+    @app.get("/api/storage")
+    def storage():
+        usage = shutil.disk_usage(settings.backup_dir)
+        return {
+            "path": str(settings.backup_dir),
+            "total": usage.total,
+            "used": usage.used,
+            "free": usage.free,
+        }
 
     @app.post("/api/jobs/{job_id}/retry")
     def retry(job_id: int):
