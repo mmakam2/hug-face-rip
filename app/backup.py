@@ -38,6 +38,21 @@ def local_dir_for(backup_dir: Path, repo_type: str, slug: str) -> Path:
     return Path(backup_dir) / f"{repo_type}s" / slug
 
 
+def delete_backup_files(backup_dir, repo_type: str, slug: str) -> None:
+    """Delete a backup's downloaded files from disk.
+
+    Refuses to touch anything that is not strictly inside ``backup_dir`` (and the
+    backup root itself), so a bad repo_type/slug can never rmtree outside it.
+    A missing directory is a no-op.
+    """
+    root = Path(backup_dir).resolve()
+    target = local_dir_for(backup_dir, repo_type, slug).resolve()
+    if target == root or not target.is_relative_to(root):
+        raise ValueError(f"refusing to delete outside backup dir: {target}")
+    if target.exists():
+        shutil.rmtree(target)
+
+
 def directory_size(path: Path) -> int:
     path = Path(path)
     if not path.exists():

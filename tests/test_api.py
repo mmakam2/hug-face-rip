@@ -201,6 +201,41 @@ def test_storage_reports_planned_bytes(ctx):
     assert client.get("/api/storage").json()["planned"] == 160   # 100 + 60
 
 
+def test_delete_completed_job_removes_files_and_row(ctx, tmp_path):
+    client, store, runner = ctx
+    from app.backup import local_dir_for
+    backup = tmp_path / "backups"                       # ctx's settings.backup_dir
+    job = store.create_job("o/n", "model")
+    d = local_dir_for(backup, "model", "o/n")
+    d.mkdir(parents=True)
+    (d / "f.bin").write_bytes(b"x" * 10)
+    store.set_status(job.id, "completed")
+    resp = client.post(f"/api/jobs/{job.id}/delete")
+    assert resp.status_code == 200
+    assert store.get_job(job.id) is None                # row gone
+    assert not d.exists()                                # files gone
+
+
+def test_delete_rejects_non_completed_job(ctx, tmp_path):
+    client, store, runner = ctx
+    from app.backup import local_dir_for
+    backup = tmp_path / "backups"
+    job = store.create_job("o/n", "model")
+    store.set_status(job.id, "running")                 # a live download
+    d = local_dir_for(backup, "model", "o/n")
+    d.mkdir(parents=True)
+    (d / "f.bin").write_bytes(b"x")
+    resp = client.post(f"/api/jobs/{job.id}/delete")
+    assert resp.status_code == 409
+    assert store.get_job(job.id) is not None             # still there
+    assert d.exists()                                    # files untouched
+
+
+def test_delete_missing_job_404(ctx):
+    client, store, runner = ctx
+    assert client.post("/api/jobs/999/delete").status_code == 404
+
+
 def test_startup_resumes_unfinished_jobs(tmp_path):
     settings = make_settings(tmp_path)
     settings.backup_dir.mkdir(parents=True, exist_ok=True)

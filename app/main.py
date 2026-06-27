@@ -8,9 +8,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .backup import JobRunner, detect_repo_types, repo_total_bytes
+from .backup import JobRunner, detect_repo_types, repo_total_bytes, delete_backup_files
 from .config import load_settings
-from .db import FAILED, JobStore, QUEUED, RUNNING
+from .db import COMPLETED, FAILED, JobStore, QUEUED, RUNNING
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -105,6 +105,17 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
             raise HTTPException(status_code=404, detail="job not found")
         if job.status != QUEUED:
             raise HTTPException(status_code=409, detail="only queued jobs can be cancelled")
+        store.delete_job(job_id)
+        return {"deleted": job_id}
+
+    @app.post("/api/jobs/{job_id}/delete")
+    def delete(job_id: int):
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.status != COMPLETED:
+            raise HTTPException(status_code=409, detail="only completed downloads can be deleted")
+        delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
         store.delete_job(job_id)
         return {"deleted": job_id}
 
