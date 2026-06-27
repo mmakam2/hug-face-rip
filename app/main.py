@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .backup import JobRunner, detect_repo_types, repo_total_bytes, delete_backup_files
 from .config import load_settings
-from .db import COMPLETED, FAILED, JobStore, PAUSED, QUEUED, RUNNING
+from .db import COMPLETED, FAILED, JobStore, PAUSED, QUEUED, RETRYING, RUNNING
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -24,13 +24,14 @@ class SlugIn(BaseModel):
 def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_total_bytes) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
-        for job in store.unfinished_jobs():
-            runner.submit(job.id)
+        # Orphaned 'running' jobs (their processes died with the old interpreter)
+        # go back to 'queued'; the dispatcher then drives everything per the valve.
+        store.reset_running_to_queued()
+        runner.start()
         yield
-        # On shutdown (e.g. systemd restart), stop the runner gracefully: queued
-        # jobs are cancelled (left 'queued') and the in-flight job is left
-        # 'running', so the next startup re-queues both instead of them crashing
-        # into 'failed' when the interpreter tears down the thread pools.
+        # On shutdown (e.g. systemd restart), stop the dispatcher and terminate
+        # in-flight downloads; their jobs are left 'running' and the next startup
+        # resets them to 'queued' for the dispatcher to resume.
         runner.shutdown()
 
     app = FastAPI(title="Hugging Face Rip", lifespan=lifespan)
@@ -64,15 +65,14 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
                 if total:
                     store.update_progress(job.id, 0, total_bytes=total)
                     job = store.get_job(job.id)
-                runner.submit(job.id)
-            elif existing.status in (RUNNING, QUEUED):
-                # Already downloading or pending — don't start a second
-                # snapshot_download into the same directory.
+                # Left 'queued'; the dispatcher will start it.
+            elif existing.status in (RUNNING, QUEUED, RETRYING, PAUSED):
+                # In progress / pending / paused -> don't disturb.
                 job = existing
             else:
-                # completed / failed -> resume or retry
+                # completed / failed -> requeue with a fresh retry budget.
                 store.requeue(existing.id)
-                runner.submit(existing.id)
+                store.reset_retry(existing.id)
                 job = store.get_job(existing.id)
             created.append(job.to_dict())
         return {"jobs": created}
@@ -90,6 +90,7 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
             "used": usage.used,
             "free": usage.free,
             "planned": store.pending_bytes(),
+            "paused_all": store.get_flag("paused_all", "0") == "1",
         }
 
     @app.post("/api/jobs/{job_id}/retry")
@@ -100,7 +101,7 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         if job.status != FAILED:
             raise HTTPException(status_code=409, detail="only failed jobs can be retried")
         store.requeue(job_id)
-        runner.submit(job_id)
+        store.reset_retry(job_id)
         return store.get_job(job_id).to_dict()
 
     @app.post("/api/jobs/{job_id}/pause")
@@ -121,7 +122,6 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         if job.status != PAUSED:
             raise HTTPException(status_code=409, detail="only paused downloads can be resumed")
         store.requeue(job_id)
-        runner.submit(job_id)
         return store.get_job(job_id).to_dict()
 
     @app.post("/api/jobs/{job_id}/cancel")
@@ -129,20 +129,30 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         job = store.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        if job.status not in (QUEUED, RUNNING, PAUSED):
+        if job.status not in (QUEUED, RUNNING, PAUSED, RETRYING):
             raise HTTPException(
                 status_code=409,
-                detail="only queued, running, or paused jobs can be cancelled",
+                detail="only queued, running, paused, or retrying jobs can be cancelled",
             )
         if job.status == RUNNING:
             # Hand off to the runner; the worker deletes files + row once the
             # child process dies (near-instant, even mid-file).
             runner.cancel(job_id)
             return {"cancelling": job_id}
-        # queued / paused: no live process — discard partial files + row directly.
+        # queued / paused / retrying: no live process — discard files + row directly.
         delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
         store.delete_job(job_id)
         return {"deleted": job_id}
+
+    @app.post("/api/pause-all")
+    def pause_all():
+        runner.pause_all()
+        return {"paused_all": True}
+
+    @app.post("/api/resume-all")
+    def resume_all():
+        runner.resume_all()
+        return {"paused_all": False}
 
     @app.post("/api/jobs/{job_id}/delete")
     def delete(job_id: int):

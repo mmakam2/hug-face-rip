@@ -1,19 +1,21 @@
 import pytest
 from fastapi.testclient import TestClient
 from app.config import Settings
-from app.db import JobStore, FAILED, QUEUED, PAUSED, RUNNING
+from app.db import JobStore, FAILED, QUEUED, PAUSED, RUNNING, RETRYING
 from app.main import create_app
 
 
 class FakeRunner:
     def __init__(self):
-        self.submitted = []
+        self.started = False
         self.paused = []
         self.cancelled = []
+        self.paused_all = 0
+        self.resumed_all = 0
         self.shutdowns = 0
 
-    def submit(self, job_id):
-        self.submitted.append(job_id)
+    def start(self):
+        self.started = True
 
     def pause(self, job_id):
         self.paused.append(job_id)
@@ -21,6 +23,12 @@ class FakeRunner:
     def cancel(self, job_id):
         self.cancelled.append(job_id)
         return True
+
+    def pause_all(self):
+        self.paused_all += 1
+
+    def resume_all(self):
+        self.resumed_all += 1
 
     def shutdown(self, wait=False):
         self.shutdowns += 1
@@ -59,8 +67,7 @@ def test_create_jobs_makes_one_per_detected_type(ctx):
     assert resp.status_code == 200
     jobs = resp.json()["jobs"]
     assert {j["repo_type"] for j in jobs} == {"model", "dataset"}
-    assert all(j["status"] == QUEUED for j in jobs)
-    assert len(runner.submitted) == 2
+    assert all(j["status"] == QUEUED for j in jobs)   # queued; the dispatcher starts them
 
 
 def test_queued_job_is_populated_with_its_size(ctx):
@@ -86,9 +93,8 @@ def test_size_lookup_failure_still_queues_job_at_zero(tmp_path):
     resp = client.post("/api/jobs", json={"slug": "x/y"})
     assert resp.status_code == 200
     job = store.list_jobs()[0]
-    assert job.status == QUEUED
-    assert job.total_bytes == 0           # best-effort: failed sizing leaves 0
-    assert job.id in runner.submitted     # job still queued to run
+    assert job.status == QUEUED            # queued for the dispatcher
+    assert job.total_bytes == 0            # best-effort: failed sizing leaves 0
     store.close()
 
 
@@ -96,7 +102,7 @@ def test_create_unknown_slug_404(ctx):
     client, store, runner = ctx
     resp = client.post("/api/jobs", json={"slug": "ghost/x"})
     assert resp.status_code == 404
-    assert runner.submitted == []
+    assert store.list_jobs() == []
 
 
 def test_create_blank_slug_400(ctx):
@@ -129,7 +135,7 @@ def test_retry_only_failed(ctx):
     resp = client.post(f"/api/jobs/{job.id}/retry")
     assert resp.status_code == 200
     assert resp.json()["status"] == QUEUED
-    assert job.id in runner.submitted
+    assert store.get_job(job.id).status == QUEUED   # the dispatcher will pick it up
 
 
 def test_cancel_removes_queued_job_from_the_list(ctx):
@@ -156,7 +162,6 @@ def test_readd_after_cancel_does_not_resurrect_cancelled_instances(ctx):
     for j in store.list_jobs():
         client.post(f"/api/jobs/{j.id}/cancel")            # cancel both
     assert store.list_jobs() == []                         # all gone
-    runner.submitted.clear()
     client.post("/api/jobs", json={"slug": "o/n"})        # re-add the same slug
     jobs = store.list_jobs()
     assert {j.repo_type for j in jobs} == {"model", "dataset"}  # fresh pair
@@ -172,7 +177,7 @@ def test_retry_missing_job_404(ctx):
 def test_create_malformed_slug_returns_400(ctx, bad):
     client, store, runner = ctx
     assert client.post("/api/jobs", json={"slug": bad}).status_code == 400
-    assert runner.submitted == []
+    assert store.list_jobs() == []
 
 
 def test_resubmit_running_job_does_not_double_run(ctx):
@@ -181,11 +186,9 @@ def test_resubmit_running_job_does_not_double_run(ctx):
     jobs = store.list_jobs()
     for j in jobs:
         store.set_status(j.id, "running")
-    runner.submitted.clear()
     resp = client.post("/api/jobs", json={"slug": "o/n"})
     assert resp.status_code == 200
-    assert runner.submitted == []                 # nothing re-submitted while running
-    assert len(store.list_jobs()) == len(jobs)    # no duplicate jobs
+    assert len(store.list_jobs()) == len(jobs)    # no duplicate jobs while running
 
 
 def test_cancel_missing_job_404(ctx):
@@ -251,22 +254,24 @@ def test_delete_missing_job_404(ctx):
     assert client.post("/api/jobs/999/delete").status_code == 404
 
 
-def test_startup_resumes_unfinished_jobs(tmp_path):
+def test_startup_resets_running_and_starts_dispatcher(tmp_path):
     settings = make_settings(tmp_path)
     settings.backup_dir.mkdir(parents=True, exist_ok=True)
     store = JobStore(settings.db_path)
-    leftover = store.create_job("resume/me", "model")  # queued
+    leftover = store.create_job("resume/me", "model")
+    store.set_status(leftover.id, RUNNING)             # orphaned from a prior run
     runner = FakeRunner()
     app = create_app(settings, store, runner, detect=lambda s, t: [])
-    with TestClient(app):  # triggers startup
+    with TestClient(app):
         pass
-    assert leftover.id in runner.submitted
+    assert runner.started is True
+    assert store.get_job(leftover.id).status == QUEUED  # reset for the dispatcher
     store.close()
 
 
 def test_lifespan_shuts_down_runner_on_exit(tmp_path):
-    # On shutdown the lifespan must call runner.shutdown() so in-flight/queued
-    # jobs are left resumable instead of crashing into 'failed' during teardown.
+    # On shutdown the lifespan must call runner.shutdown() so in-flight downloads
+    # are terminated and left resumable instead of crashing into 'failed'.
     settings = make_settings(tmp_path)
     settings.backup_dir.mkdir(parents=True, exist_ok=True)
     store = JobStore(settings.db_path)
@@ -302,7 +307,7 @@ def test_resume_only_paused(ctx):
     resp = client.post(f"/api/jobs/{job.id}/resume")
     assert resp.status_code == 200
     assert resp.json()["status"] == QUEUED
-    assert job.id in runner.submitted
+    assert store.get_job(job.id).status == QUEUED   # dispatcher will resume it
 
 
 def test_resume_missing_job_404(ctx):
@@ -350,5 +355,47 @@ def test_startup_does_not_resume_paused_jobs(tmp_path):
     app = create_app(settings, store, runner, detect=lambda s, t: [])
     with TestClient(app):
         pass
-    assert paused.id not in runner.submitted   # paused jobs are NOT auto-resumed
+    assert store.get_job(paused.id).status == PAUSED   # untouched by startup reset
     store.close()
+
+
+def test_pause_all_and_resume_all(ctx):
+    client, store, runner = ctx
+    assert client.post("/api/pause-all").status_code == 200
+    assert runner.paused_all == 1
+    assert client.post("/api/resume-all").status_code == 200
+    assert runner.resumed_all == 1
+
+
+def test_storage_reports_paused_all_flag(ctx):
+    client, store, runner = ctx
+    assert client.get("/api/storage").json()["paused_all"] is False
+    store.set_flag("paused_all", "1")
+    assert client.get("/api/storage").json()["paused_all"] is True
+
+
+def test_cancel_retrying_deletes_files_and_row(ctx, tmp_path):
+    client, store, runner = ctx
+    from app.backup import local_dir_for
+    backup = tmp_path / "backups"
+    job = store.create_job("o/n", "model")
+    d = local_dir_for(backup, "model", "o/n")
+    d.mkdir(parents=True)
+    (d / "partial.bin").write_bytes(b"x" * 10)
+    store.schedule_retry(job.id, "blip", 30)            # status retrying
+    resp = client.post(f"/api/jobs/{job.id}/cancel")
+    assert resp.status_code == 200
+    assert store.get_job(job.id) is None
+    assert not d.exists()
+    assert runner.cancelled == []                        # no live process during backoff
+
+
+def test_retry_resets_retry_count(ctx):
+    client, store, runner = ctx
+    job = store.create_job("a/b", "model")
+    store.schedule_retry(job.id, "blip", 30)            # retry_count -> 1, status retrying
+    store.set_status(job.id, FAILED)                     # exhausted -> failed
+    resp = client.post(f"/api/jobs/{job.id}/retry")
+    assert resp.status_code == 200
+    j = store.get_job(job.id)
+    assert j.status == QUEUED and j.retry_count == 0
