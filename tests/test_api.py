@@ -126,6 +126,16 @@ def test_cancel_missing_job_404(ctx):
     assert client.post("/api/jobs/999/cancel").status_code == 404
 
 
+def test_storage_reports_backup_disk_usage(ctx):
+    client, store, runner = ctx
+    body = client.get("/api/storage").json()
+    assert body["total"] > 0
+    assert body["used"] >= 0
+    assert body["free"] >= 0
+    assert body["free"] <= body["total"]
+    assert body["used"] <= body["total"]
+
+
 def test_startup_resumes_unfinished_jobs(tmp_path):
     settings = make_settings(tmp_path)
     settings.backup_dir.mkdir(parents=True, exist_ok=True)
