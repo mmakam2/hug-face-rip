@@ -96,6 +96,13 @@ headroom, leave Xet enabled but bound it with `HF_XET_NUM_CONCURRENT_RANGE_GETS`
 `MemoryMax` as a cgroup backstop). **Do not** set `HF_XET_HIGH_PERFORMANCE` — it saturates network
 and all cores and is the most memory-hungry mode.
 
+**Subprocess memory model (post pause/resume):** Each concurrent download now runs in its own
+spawned Python child process, so `MAX_CONCURRENT_JOBS` multiplies whole-process baseline memory
+(including `hf_xet` buffer pools), not just per-thread buffers — plan headroom accordingly.
+`MemoryMax` still bounds the total because child processes inherit the parent's systemd cgroup.
+Importantly, an OOM kill now most likely terminates a single download child rather than the whole
+server — that job lands in `failed` (retryable, partial files kept) and the dashboard stays up.
+
 Binding to `0.0.0.0` (the default) exposes an **unauthenticated** dashboard that downloads using
 your HF token — only run on a trusted network, or set `HOST=127.0.0.1`.
 

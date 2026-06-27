@@ -378,6 +378,38 @@ def test_runner_pause_sets_job_paused(tmp_path):
     store.close()
 
 
+def test_worker_marks_failed_on_unexpected_process_exit(tmp_path):
+    # Covers the 'outcome is None' branch: child process exited without reporting
+    # any outcome (e.g. OOM-killed by the kernel).  run_backup_job must set the
+    # job to FAILED with a message mentioning 'exited unexpectedly' and the exit code.
+    # Uses a minimal fake launcher/handle — does NOT touch InThreadLauncher/_FakeHandle.
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+
+    class _OomHandle:
+        exitcode = -9
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return None   # no outcome: child was killed externally
+
+    class _OomLauncher:
+        def start(self, **kwargs):
+            (Path(kwargs["local_dir"])).mkdir(parents=True, exist_ok=True)
+            return _OomHandle()
+
+    run_backup_job(job.id, store, settings, api=FakeApi(10), launcher=_OomLauncher(),
+                   registry=None)
+    failed = store.get_job(job.id)
+    assert failed.status == FAILED
+    assert "exited unexpectedly" in (failed.error or "")
+    assert "-9" in (failed.error or "")
+    store.close()
+
+
 def test_runner_cancel_terminates_and_removes_job(tmp_path):
     settings = make_settings(tmp_path, max_jobs=1)
     store = JobStore(settings.db_path)

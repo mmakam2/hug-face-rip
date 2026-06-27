@@ -61,14 +61,20 @@ def directory_size(path: Path) -> int:
         return 0
     total = 0
     for item in path.rglob("*"):
-        if not item.is_file():
+        try:
+            if not item.is_file():
+                continue
+            in_cache = ".cache" in item.relative_to(path).parts
+            # Count completed files, plus Xet's in-flight .incomplete staging which
+            # lives under .cache/huggingface/download/ — those bytes are on disk and
+            # would otherwise make progress look frozen until files finalize.
+            if not in_cache or item.suffix == ".incomplete":
+                total += item.stat().st_size
+        except OSError:
+            # A file can vanish between rglob() and stat() when the cancel path's
+            # rmtree runs concurrently with the poller thread.  Skip the gone item
+            # rather than crashing the daemon poller with a traceback.
             continue
-        in_cache = ".cache" in item.relative_to(path).parts
-        # Count completed files, plus Xet's in-flight .incomplete staging which
-        # lives under .cache/huggingface/download/ — those bytes are on disk and
-        # would otherwise make progress look frozen until files finalize.
-        if not in_cache or item.suffix == ".incomplete":
-            total += item.stat().st_size
     return total
 
 
