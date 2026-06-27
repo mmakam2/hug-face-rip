@@ -116,6 +116,11 @@ class JobStore:
             )
             self._conn.commit()
 
+    def delete_job(self, job_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            self._conn.commit()
+
     def unfinished_jobs(self) -> List[Job]:
         with self._lock:
             rows = self._conn.execute(
