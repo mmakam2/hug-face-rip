@@ -1,0 +1,38 @@
+[Unit]
+Description=HF Repo Backup Dashboard
+Documentation=file:///root/hug-face-rip/README.md
+After=network-online.target
+Wants=network-online.target
+# Don't hammer the box if the app crash-loops: give up after 5 starts in 5 min.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/hug-face-rip
+# build_default_app() calls load_dotenv(), so .env in WorkingDirectory is read.
+# systemd sets these vars before the process starts, and load_dotenv() does not
+# override existing vars — so they tune this memory-constrained host (2 GB RAM).
+Environment=HOST=0.0.0.0
+Environment=PORT=8000
+Environment=MAX_CONCURRENT_JOBS=1
+Environment=MAX_WORKERS=2
+# hf-xet's adaptive concurrency ramps download buffers past any sane cap and
+# OOM-kills the box. Disable it: plain HTTP streaming writes straight to disk
+# with near-constant memory. Slower than Xet, but it won't crash unattended.
+Environment=HF_HUB_DISABLE_XET=1
+ExecStart=/root/hug-face-rip/.venv/bin/python -m app.main
+# Memory backstop: cap the service at 2.5G so a runaway download is contained to
+# this unit instead of OOM-killing the whole box (4G RAM). No MemoryHigh — the
+# Xet downloader's memory is mostly non-reclaimable anon, so a soft throttle just
+# wedges it in reclaim; the hard cap alone is the right tool here.
+MemoryAccounting=yes
+MemoryMax=2560M
+# Keep the dashboard up; the app re-queues unfinished jobs on startup, so an
+# interrupted download resumes automatically after a restart.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

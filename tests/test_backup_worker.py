@@ -133,3 +133,22 @@ def test_runner_runs_job_to_completion(tmp_path):
     runner.shutdown()  # waits for completion
     assert store.get_job(job.id).status == COMPLETED
     store.close()
+
+
+def test_worker_fails_when_insufficient_disk(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    # Pretend the filesystem is almost full (1 KB free); the repo "needs" 1 GB.
+    monkeypatch.setattr("app.backup.free_disk_bytes", lambda path: 1000)
+    called = []
+
+    def downloader(**kwargs):
+        called.append(True)
+
+    run_backup_job(job.id, store, settings, api=FakeApi(1_000_000_000), downloader=downloader)
+    failed = store.get_job(job.id)
+    assert failed.status == FAILED
+    assert "disk space" in failed.error
+    assert called == []  # download must NOT be attempted when it cannot fit
+    store.close()
