@@ -17,3 +17,7 @@ def error_target(queue, kwargs):
 def sleep_target(queue, kwargs):
     time.sleep(30)            # long enough that the test always terminates it first
     queue.put(("ok", None))   # unreached when terminated
+
+
+def retryable_error_target(queue, kwargs):
+    queue.put(("error", "dns blip", True))

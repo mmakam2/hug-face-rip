@@ -15,20 +15,23 @@ from typing import Optional
 class Outcome:
     ok: bool
     error: Optional[str] = None
+    retryable: bool = False
 
 
 def _download_entry(queue, kwargs):
     """Child entry point. Runs the real snapshot_download and reports the result.
 
-    Reports every failure (including unusual ones) as an error string rather than
-    crashing silently. Never imported with side effects, so it is spawn-safe.
+    Reports every failure (including unusual ones) as an error string plus a
+    retryable flag (so the worker can decide whether to auto-retry). Never
+    imported with side effects, so it is spawn-safe.
     """
     try:
         from huggingface_hub import snapshot_download
         snapshot_download(**kwargs)
-        queue.put(("ok", None))
+        queue.put(("ok", None, False))
     except BaseException as exc:  # noqa: BLE001 - surface anything as a job error
-        queue.put(("error", str(exc)[:500]))
+        from .retry import is_retryable
+        queue.put(("error", str(exc)[:500], is_retryable(exc)))
 
 
 class ProcessHandle:
@@ -49,16 +52,18 @@ class ProcessHandle:
         """Block until the child exits, then return the Outcome it reported.
 
         Returns None if the child exited without reporting one (i.e. it was
-        terminated mid-download). The reported payload is tiny, so reading it
-        after join carries no risk of the feeder-thread deadlock that large
+        terminated mid-download). Tolerates a 2-tuple (legacy/no-retryable) or a
+        3-tuple (tag, error, retryable). The reported payload is tiny, so reading
+        it after join carries no risk of the feeder-thread deadlock that large
         Queue items can cause.
         """
         self._process.join(timeout)
         try:
-            tag, error = self._queue.get_nowait()
+            tag, error, *rest = self._queue.get_nowait()
         except _queue.Empty:
             return None
-        return Outcome(ok=(tag == "ok"), error=error)
+        retryable = bool(rest[0]) if rest else False
+        return Outcome(ok=(tag == "ok"), error=error, retryable=retryable)
 
 
 class SubprocessLauncher:
