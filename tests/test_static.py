@@ -45,3 +45,9 @@ def test_storage_bar_has_used_and_planned_segments(client):
     assert "sused" in page            # current-usage segment
     assert ".splanned" in page        # planned (queued + running-remaining) segment
     assert ".splanned.over" in page   # overflow color rule when projected > capacity
+
+
+def test_completed_rows_have_confirm_guarded_delete(client):
+    page = client.get("/").text
+    assert "confirmDelete" in page    # delete control wired into the row
+    assert "confirm(" in page         # native confirmation before deleting

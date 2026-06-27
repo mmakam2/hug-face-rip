@@ -2,7 +2,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 from huggingface_hub.utils import RepositoryNotFoundError
-from app.backup import detect_repo_types, repo_total_bytes, local_dir_for, directory_size
+from app.backup import detect_repo_types, repo_total_bytes, local_dir_for, directory_size, delete_backup_files
 
 
 class _Sibling:
@@ -84,3 +84,30 @@ def test_directory_size_counts_incomplete_staging_under_cache(tmp_path):
 
 def test_directory_size_missing_path_is_zero(tmp_path):
     assert directory_size(tmp_path / "nope") == 0
+
+
+def test_delete_backup_files_removes_dir_within_backup(tmp_path):
+    backup = tmp_path / "backups"
+    d = local_dir_for(backup, "model", "owner/name")
+    d.mkdir(parents=True)
+    (d / "weights.bin").write_bytes(b"x" * 100)
+    delete_backup_files(backup, "model", "owner/name")
+    assert not d.exists()
+
+
+def test_delete_backup_files_missing_dir_is_noop(tmp_path):
+    backup = tmp_path / "backups"
+    backup.mkdir()
+    delete_backup_files(backup, "model", "ghost/repo")  # nothing there -> no error
+
+
+def test_delete_backup_files_refuses_path_outside_backup(tmp_path):
+    backup = tmp_path / "backups"
+    backup.mkdir()
+    outside = tmp_path / "secret"
+    outside.mkdir()
+    (outside / "important").write_bytes(b"keep")
+    # slug crafted to escape backup/models/ via traversal
+    with pytest.raises(ValueError):
+        delete_backup_files(backup, "model", "../../secret")
+    assert (outside / "important").exists()  # untouched

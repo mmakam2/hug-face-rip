@@ -94,11 +94,18 @@ async function act(id, what) {
   catch (e) { alert(e.message); }
 }
 window.act = act;
+function confirmDelete(id, slug, bytes) {
+  if (!confirm(`Delete ${slug} and its downloaded files (${fmt(bytes)})? This frees disk space and cannot be undone.`)) return;
+  act(id, "delete");
+}
+window.confirmDelete = confirmDelete;
 function row(j) {
   const actions = j.status === "failed"
     ? `<button class="ghost" onclick="act(${j.id},'retry')">Retry</button>`
     : j.status === "queued"
     ? `<button class="ghost" onclick="act(${j.id},'cancel')">Cancel</button>`
+    : j.status === "completed"
+    ? `<button class="ghost" onclick="confirmDelete(${j.id},'${esc(j.slug)}',${j.total_bytes})">Delete</button>`
     : "";
   return `<tr>
     <td><div class="repo">${esc(j.slug)}</div><span class="badge ${esc(j.repo_type)}">${esc(j.repo_type)}</span>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</td>
