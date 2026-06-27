@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HF Repo Backup</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;--muted:#8b94a7;--accent:#ffb000;--ok:#3fb950;--err:#f85149}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:920px;margin:0 auto;padding:36px 20px}
+h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
+.sub{color:var(--muted);margin:0 0 24px}
+code{background:var(--card);padding:1px 6px;border-radius:5px}
+form{display:flex;gap:8px;margin-bottom:26px}
+input{flex:1;background:var(--card);border:1px solid var(--line);color:var(--fg);padding:11px 13px;border-radius:8px;font-size:15px}
+input:focus{outline:none;border-color:var(--accent)}
+button{background:var(--accent);color:#1b1b1b;border:0;border-radius:8px;padding:11px 18px;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--muted);border:1px solid var(--line);padding:6px 11px;font-weight:500}
+button.ghost:hover{color:var(--fg);border-color:var(--muted)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em;padding:0 10px 10px}
+td{padding:12px 10px;border-top:1px solid var(--line);vertical-align:middle}
+.repo{font-weight:600}
+.type{color:var(--muted);font-size:13px}
+.bar{height:6px;background:var(--line);border-radius:99px;overflow:hidden;min-width:130px}
+.bar>span{display:block;height:100%;background:var(--accent);transition:width .4s ease}
+.st{font-size:13px;font-weight:600;text-transform:capitalize}
+.st.completed{color:var(--ok)}.st.failed{color:var(--err)}.st.running{color:var(--accent)}.st.queued,.st.cancelled{color:var(--muted)}
+.err{color:var(--err);font-size:12px;margin-top:4px;max-width:420px}
+.size{color:var(--muted);font-size:13px;white-space:nowrap}
+.empty{color:var(--muted);text-align:center;padding:44px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Hugging Face Repo Backup</h1>
+  <p class="sub">Paste a repo slug (e.g. <code>bigscience/bloom</code>) to back it up to your local folder.</p>
+  <form id="f">
+    <input id="slug" placeholder="owner/name" autocomplete="off" autofocus />
+    <button type="submit">Back up</button>
+  </form>
+  <table>
+    <thead><tr><th>Repo</th><th>Status</th><th>Progress</th><th>Size</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty">No backups yet.</div>
+</div>
+<script>
+const fmt = b => {
+  if (!b) return "0 B";
+  const u = ["B","KB","MB","GB","TB"];
+  const i = Math.min(u.length - 1, Math.floor(Math.log(b) / Math.log(1024)));
+  return (b / Math.pow(1024, i)).toFixed(i ? 1 : 0) + " " + u[i];
+};
+const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(e.detail || "request failed");
+  }
+  return r.json();
+}
+document.getElementById("f").addEventListener("submit", async e => {
+  e.preventDefault();
+  const el = document.getElementById("slug");
+  const slug = el.value.trim();
+  if (!slug) return;
+  try {
+    await api("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ slug }) });
+    el.value = "";
+    refresh();
+  } catch (err) { alert(err.message); }
+});
+async function act(id, what) {
+  try { await api(`/api/jobs/${id}/${what}`, { method: "POST" }); refresh(); }
+  catch (e) { alert(e.message); }
+}
+window.act = act;
+function row(j) {
+  const actions = j.status === "failed"
+    ? `<button class="ghost" onclick="act(${j.id},'retry')">Retry</button>`
+    : j.status === "queued"
+    ? `<button class="ghost" onclick="act(${j.id},'cancel')">Cancel</button>`
+    : "";
+  return `<tr>
+    <td><div class="repo">${esc(j.slug)}</div><div class="type">${esc(j.repo_type)}</div>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</td>
+    <td><span class="st ${esc(j.status)}">${esc(j.status)}</span></td>
+    <td><div class="bar"><span style="width:${j.percent}%"></span></div><div class="type">${j.percent}%</div></td>
+    <td class="size">${fmt(j.downloaded_bytes)} / ${fmt(j.total_bytes)}</td>
+    <td>${actions}</td></tr>`;
+}
+async function refresh() {
+  try {
+    const { jobs } = await api("/api/jobs");
+    document.getElementById("rows").innerHTML = jobs.map(row).join("");
+    document.getElementById("empty").style.display = jobs.length ? "none" : "block";
+  } catch (e) { /* transient; keep polling */ }
+}
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
