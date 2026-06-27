@@ -27,6 +27,11 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         for job in store.unfinished_jobs():
             runner.submit(job.id)
         yield
+        # On shutdown (e.g. systemd restart), stop the runner gracefully: queued
+        # jobs are cancelled (left 'queued') and the in-flight job is left
+        # 'running', so the next startup re-queues both instead of them crashing
+        # into 'failed' when the interpreter tears down the thread pools.
+        runner.shutdown()
 
     app = FastAPI(title="Hugging Face Rip", lifespan=lifespan)
 

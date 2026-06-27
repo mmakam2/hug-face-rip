@@ -1,7 +1,8 @@
+import threading
 from pathlib import Path
 import pytest
 from app.config import Settings
-from app.db import JobStore, COMPLETED, FAILED, CANCELLED
+from app.db import JobStore, COMPLETED, FAILED, CANCELLED, RUNNING
 from app.backup import run_backup_job, JobRunner
 
 
@@ -71,6 +72,47 @@ def test_worker_marks_failed_on_download_error(tmp_path):
     store.close()
 
 
+def test_worker_leaves_job_resumable_on_shutdown(tmp_path):
+    # When the process is shutting down, snapshot_download's thread pool raises
+    # "cannot schedule new futures after interpreter shutdown". That is NOT a real
+    # download failure — the job must be left in 'running' so the startup re-queue
+    # resumes it, not marked 'failed' (which would defeat auto-resume).
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    stopping = threading.Event()
+    stopping.set()
+
+    def boom(**kwargs):
+        raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+    run_backup_job(job.id, store, settings, api=FakeApi(10),
+                   downloader=boom, stopping=stopping)
+    resumable = store.get_job(job.id)
+    assert resumable.status == RUNNING   # left resumable, NOT failed
+    assert resumable.error is None
+    store.close()
+
+
+def test_worker_marks_failed_when_not_shutting_down(tmp_path):
+    # A genuine download error (stopping event present but NOT set) still fails
+    # the job, so normal failures are unaffected by the shutdown handling.
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    stopping = threading.Event()  # not set
+
+    def boom(**kwargs):
+        raise RuntimeError("network exploded")
+
+    run_backup_job(job.id, store, settings, api=FakeApi(10),
+                   downloader=boom, stopping=stopping)
+    failed = store.get_job(job.id)
+    assert failed.status == FAILED
+    assert "network exploded" in failed.error
+    store.close()
+
+
 def test_worker_skips_cancelled_job(tmp_path):
     settings = make_settings(tmp_path)
     store = JobStore(settings.db_path)
@@ -130,8 +172,21 @@ def test_runner_runs_job_to_completion(tmp_path):
     runner = JobRunner(store, settings, api=FakeApi(11),
                        downloader=fake_downloader_factory(b"y" * 11))
     runner.submit(job.id)
-    runner.shutdown()  # waits for completion
+    runner.shutdown(wait=True)  # drain: waits for completion
     assert store.get_job(job.id).status == COMPLETED
+    store.close()
+
+
+def test_runner_shutdown_sets_stopping_flag(tmp_path):
+    # shutdown() must raise the stopping flag so in-flight workers know the
+    # process is going away and leave their jobs resumable.
+    settings = make_settings(tmp_path, max_jobs=1)
+    store = JobStore(settings.db_path)
+    runner = JobRunner(store, settings, api=FakeApi(1),
+                       downloader=fake_downloader_factory(b"z"))
+    assert not runner._stopping.is_set()
+    runner.shutdown()  # non-blocking by default
+    assert runner._stopping.is_set()
     store.close()
 
 
