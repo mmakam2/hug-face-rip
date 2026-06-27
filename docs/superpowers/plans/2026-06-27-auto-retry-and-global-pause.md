@@ -14,7 +14,7 @@
 - **Never read `.env`.**
 - **Default suite stays offline** — only `-m integration` touches the network.
 - **Backoff schedule:** `BACKOFF_SECONDS = [30, 60, 120, 240, 480]`, `MAX_RETRIES = 5`. Retry `i` (0-based) waits `BACKOFF_SECONDS[i]`; after the 5th failure the job is final-`failed`.
-- **Retryable** = `socket.gaierror`, `requests.exceptions.ConnectionError`, `requests.exceptions.Timeout`, `huggingface_hub.utils.HfHubHTTPError` with status ∈ {429,500,502,503,504}, connection-related `OSError`. **Permanent** = everything else (404/gated/auth/`ValueError`/disk-space `RuntimeError`). An unexpected child exit (`None` outcome) is treated as **retryable**.
+- **Retryable** = `httpx.TransportError` (connect errors, timeouts, network/protocol errors — huggingface_hub uses **httpx**, not requests, in this env), `huggingface_hub.utils.HfHubHTTPError` with status ∈ {429,500,502,503,504}, raw `socket.gaierror`, connection-related `OSError`. **Permanent** = everything else (404/gated/auth/`ValueError`/disk-space `RuntimeError`). An unexpected child exit (`None` outcome) is treated as **retryable**.
 - **`retry_count` resets to 0** on successful completion and on manual Retry; it does NOT reset on partial progress.
 - **Valve is persistent** (`app_state.paused_all`), survives restart. Global pause is **separate** from per-job pause: per-job `paused` jobs are never auto-started.
 - **Status lifecycle:** `queued → running → completed | failed | paused | retrying`; `retrying → (backoff) → running`; global pause requeues running → `queued` via a new `requeue` intent. `CANCELLED` stays defined-but-unset.
