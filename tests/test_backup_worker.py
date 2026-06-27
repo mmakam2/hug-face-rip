@@ -108,6 +108,21 @@ def test_worker_marks_failed_when_sizing_fails(tmp_path):
     store.close()
 
 
+def test_worker_marks_failed_when_local_dir_cannot_be_created(tmp_path):
+    settings = make_settings(tmp_path)
+    # Make the would-be parent ("models") a FILE so mkdir(parents=True) fails.
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    (settings.backup_dir / "models").write_text("i am a file, not a dir")
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    run_backup_job(job.id, store, settings, api=FakeApi(10),
+                   downloader=fake_downloader_factory(b"x"))
+    failed = store.get_job(job.id)
+    assert failed.status == FAILED
+    assert failed.error
+    store.close()
+
+
 def test_runner_runs_job_to_completion(tmp_path):
     settings = make_settings(tmp_path, max_jobs=1)
     store = JobStore(settings.db_path)

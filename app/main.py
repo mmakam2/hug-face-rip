@@ -1,3 +1,4 @@
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -7,7 +8,9 @@ from pydantic import BaseModel
 
 from .backup import JobRunner, detect_repo_types
 from .config import load_settings
-from .db import CANCELLED, FAILED, JobStore, QUEUED
+from .db import CANCELLED, FAILED, JobStore, QUEUED, RUNNING
+
+SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -34,18 +37,26 @@ def create_app(settings, store, runner, detect=detect_repo_types) -> FastAPI:
         slug = body.slug.strip()
         if not slug:
             raise HTTPException(status_code=400, detail="slug is required")
+        if not SLUG_RE.match(slug):
+            raise HTTPException(status_code=400, detail="invalid slug; expected 'owner/name'")
         types = detect(slug, settings.hf_token)
         if not types:
             raise HTTPException(status_code=404, detail="repo not found or not accessible")
         created = []
         for repo_type in types:
             existing = store.get_job_by_repo(repo_type, slug)
-            if existing:
-                store.requeue(existing.id)
-                job = store.get_job(existing.id)
-            else:
+            if existing is None:
                 job = store.create_job(slug, repo_type)
-            runner.submit(job.id)
+                runner.submit(job.id)
+            elif existing.status in (RUNNING, QUEUED):
+                # Already downloading or pending — don't start a second
+                # snapshot_download into the same directory.
+                job = existing
+            else:
+                # completed / failed / cancelled -> resume or retry
+                store.requeue(existing.id)
+                runner.submit(existing.id)
+                job = store.get_job(existing.id)
             created.append(job.to_dict())
         return {"jobs": created}
 

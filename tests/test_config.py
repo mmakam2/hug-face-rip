@@ -47,3 +47,9 @@ def test_unconstructable_backup_dir_raises(tmp_path):
     env = {"HUGGINGFACE_ACCESS_KEY": "hf_test", "BACKUP_DIR": str(blocker / "sub")}
     with pytest.raises(ConfigError, match="BACKUP_DIR"):
         load_settings(env)
+
+
+def test_invalid_integer_raises(tmp_path):
+    env = base_env(tmp_path) | {"MAX_CONCURRENT_JOBS": "notanumber"}
+    with pytest.raises(ConfigError):
+        load_settings(env)

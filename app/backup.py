@@ -20,7 +20,7 @@ def detect_repo_types(slug: str, token: str, api: Optional[HfApi] = None) -> Lis
         try:
             api.repo_info(repo_id=slug, repo_type=repo_type, token=token or None)
             found.append(repo_type)
-        except (RepositoryNotFoundError, GatedRepoError, HfHubHTTPError):
+        except (RepositoryNotFoundError, GatedRepoError, HfHubHTTPError, ValueError):
             continue
     return found
 
@@ -62,7 +62,6 @@ def run_backup_job(job_id, store, settings, api=None, downloader=None) -> None:
 
     store.set_status(job_id, "running")
     local_dir = local_dir_for(settings.backup_dir, job.repo_type, job.slug)
-    local_dir.mkdir(parents=True, exist_ok=True)
 
     stop = threading.Event()
 
@@ -73,6 +72,10 @@ def run_backup_job(job_id, store, settings, api=None, downloader=None) -> None:
 
     poller = threading.Thread(target=_poll, daemon=True)
     try:
+        backup_root = settings.backup_dir.resolve()
+        if not local_dir.resolve().is_relative_to(backup_root):
+            raise ValueError(f"refusing to write outside backup dir: {local_dir}")
+        local_dir.mkdir(parents=True, exist_ok=True)
         total = repo_total_bytes(job.slug, job.repo_type, settings.hf_token, api=api)
         store.update_progress(job_id, directory_size(local_dir), total_bytes=total)
         poller.start()
