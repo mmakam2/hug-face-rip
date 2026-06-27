@@ -16,7 +16,7 @@ automatic resume across both transient failures and server restarts.
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `HUGGINGFACE_ACCESS_KEY` | yes | — | HF access token, used to authenticate downloads (incl. private/gated repos). |
-| `BACKUP_DIR` | yes | — | Destination root folder. Each repo is backed up to `BACKUP_DIR/<owner>__<name>`. |
+| `BACKUP_DIR` | yes | — | Destination root folder. Each repo is backed up to `BACKUP_DIR/<repo_type>s/<owner>/<name>` (e.g. `BACKUP_DIR/datasets/bigcode/the-stack`), mirroring the Hub's URL layout. |
 | `MAX_CONCURRENT_JOBS` | no | `2` | How many repos download simultaneously. |
 | `MAX_WORKERS` | no | `8` | Parallel file-download threads per repo (passed to `snapshot_download`). |
 | `DB_PATH` | no | `jobs.db` | SQLite job-store location. |
@@ -43,22 +43,31 @@ A FastAPI app with a background worker pool:
 - **`config.py`** — load + validate `.env`. Exposes a typed settings object.
 - **`db.py`** — SQLite job store. Single `jobs` table:
   `id, slug, repo_type, status, total_bytes, downloaded_bytes, error,
-  created_at, updated_at`. Statuses: `queued → running → completed | failed`,
-  plus `cancelled` for queued jobs cancelled before they start. All access is
-  thread-safe (short-lived connections / serialized writes).
-- **`backup.py`** — the worker. Responsibilities:
-  1. **Auto-detect repo type** — probe `model`, then `dataset`, then `space`
-     via `HfApi.repo_info`; first hit wins. If none match, fail with
-     "repo not found or not accessible".
-  2. **Size the repo** — sum sibling file sizes from `repo_info(files_metadata=True)`
-     to get `total_bytes`.
-  3. **Download** — `snapshot_download(repo_id, repo_type, local_dir=BACKUP_DIR/<owner>__<name>,
-     token=..., max_workers=MAX_WORKERS)`. `local_dir` produces real files
-     (not cache symlinks), which is what a backup should be.
-  4. **Progress poller** — a lightweight loop sums bytes-on-disk in the target
-     dir every ~1.5s and writes `downloaded_bytes`, giving a live percentage
-     without hooking the library's internals.
-  5. Concurrency gated by a `threading.Semaphore(MAX_CONCURRENT_JOBS)`.
+  created_at, updated_at`. A repo's identity is the tuple
+  **`(repo_type, slug)`** — that is the unique key (a model and a dataset that
+  share `owner/name` are two distinct backups). A `UNIQUE(repo_type, slug)`
+  index prevents duplicate active jobs for the same repo; re-submitting an
+  existing repo resumes/retries it rather than creating a duplicate. Statuses:
+  `queued → running → completed | failed`, plus `cancelled` for queued jobs
+  cancelled before they start. All access is thread-safe (short-lived
+  connections / serialized writes).
+- **`backup.py`** — repo-type detection plus the download worker.
+  - **`detect_repo_types(slug) -> list[str]`** — probes `model`, `dataset`,
+    and `space` via `HfApi.repo_info` and returns *every* type that resolves
+    (a slug can validly exist in more than one namespace). Called by the API at
+    job-creation time so each matching type becomes its own job. Empty list ⇒
+    "repo not found or not accessible".
+  - **Worker** — given a job's known `(repo_type, slug)`:
+    1. **Size the repo** — sum sibling file sizes from
+       `repo_info(files_metadata=True)` to get `total_bytes`.
+    2. **Download** — `snapshot_download(repo_id, repo_type,
+       local_dir=BACKUP_DIR/<repo_type>s/<owner>/<name>, token=...,
+       max_workers=MAX_WORKERS)`. `local_dir` produces real files (not cache
+       symlinks), which is what a backup should be.
+    3. **Progress poller** — a lightweight loop sums bytes-on-disk in the
+       target dir every ~1.5s and writes `downloaded_bytes`, giving a live
+       percentage without hooking the library's internals.
+    4. Concurrency gated by a `threading.Semaphore(MAX_CONCURRENT_JOBS)`.
 - **`main.py`** — FastAPI routes + static file serving + startup resume hook.
 - **`static/index.html` (+ inline JS/CSS)** — paste-slug form and a live job
   table that polls the API.
@@ -66,9 +75,14 @@ A FastAPI app with a background worker pool:
 ## Data Flow
 
 1. User pastes a slug → `POST /api/jobs`.
-2. API inserts a `queued` row and submits the job to the worker pool.
-3. Worker acquires the semaphore, detects type, sizes the repo, downloads to
-   `BACKUP_DIR`, and updates progress as it goes.
+2. The API calls `detect_repo_types(slug)`. For each matching type it inserts a
+   `queued` row keyed on `(repo_type, slug)` and submits it to the worker pool;
+   the response lists the created jobs. Zero matches → `404` with
+   "repo not found or not accessible". A type already present resumes/retries
+   instead of duplicating.
+3. Each worker acquires the semaphore, sizes its repo, downloads to its
+   `BACKUP_DIR/<repo_type>s/<owner>/<name>` folder, and updates progress as it
+   goes.
 4. Frontend polls `GET /api/jobs` every ~1.5s and re-renders the table
    (status, progress bar, downloaded/total, error text).
 
@@ -97,7 +111,7 @@ message surfaced in the table; the server stays up:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Dashboard HTML. |
-| `POST` | `/api/jobs` | Body `{ "slug": "owner/name" }`. Create + enqueue a job. |
+| `POST` | `/api/jobs` | Body `{ "slug": "owner/name" }`. Detects matching repo type(s) and creates one queued job per match (resuming any that already exist); returns the created/affected jobs. `404` if the slug matches no type. |
 | `GET` | `/api/jobs` | List all jobs with live progress (polling endpoint). |
 | `POST` | `/api/jobs/{id}/retry` | Re-queue a `failed` job (resumes). |
 | `POST` | `/api/jobs/{id}/cancel` | Cancel a `queued` job (no-op if already running). |
