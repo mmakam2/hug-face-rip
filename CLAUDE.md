@@ -44,25 +44,31 @@ Request/data flow across the four modules:
   token, creates/writes-checks `BACKUP_DIR`, raises `ConfigError` on bad input.
 - **`db.py`** — `JobStore` wraps **one** SQLite connection shared across threads (a `threading.Lock`
   guards every call; `check_same_thread=False`). `Job` has a computed `percent`. Status lifecycle:
-  `queued → running → completed | failed | paused`; paused jobs are excluded from startup
-  re-queuing and can be resumed manually. Cancelling removes the row for queued jobs and also
-  terminates the child process and discards downloaded files for running or paused jobs.
-  `UNIQUE(repo_type, slug)` means one row per repo+type, so re-adding a repo resumes/retries the
-  existing job rather than duplicating it.
-- **`backup.py`** — the worker engine. `JobRunner` holds a `ThreadPoolExecutor(max_workers=
-  max_concurrent_jobs)` — this bounds how many **repos** download at once. `run_backup_job()`
-  handles **one** repo: size it via `repo_total_bytes`, run a **pre-flight disk-space check**
-  (fails cleanly rather than filling the disk / OOMing), then call `snapshot_download(...,
-  max_workers=max_workers)` — which bounds parallel **files within** that repo. Each download
-  now runs in a **terminable child process** (`app/launcher.py`, `SubprocessLauncher`, spawn
-  start method) so a running download can be paused or cancelled near-instantly even mid-file;
-  a `RunningRegistry` on `JobRunner` maps `job_id → handle`+intent, and the worker performs
-  the single terminal transition (`paused`, delete-on-cancel, or `completed`/`failed`) after
-  the child exits.
-- **`main.py`** — HTTP API + serves the `static/` dashboard. The FastAPI **lifespan hook re-queues
-  every unfinished job on startup**, which is the auto-resume mechanism. Endpoints: `POST/GET
-  /api/jobs`, `GET /api/storage` (includes `planned` = queued + in-flight bytes still to download),
-  `POST /api/jobs/{id}/retry|cancel|delete` (`delete` removes a completed backup's files and row).
+  `queued → running → completed | failed | paused | retrying`. A **transient** failure (DNS,
+  connection drop, timeout, 5xx/429 — classified by `app/retry.py` against httpx) auto-retries up
+  to 5× with backoff `30s/60s/2m/4m/8m` (status `retrying`, `next_retry_at`); **permanent** errors
+  (404/gated/bad slug/disk-full) go straight to `failed`. Paused jobs are excluded from startup
+  re-queuing and resumed manually. Cancelling removes the row for queued/paused/retrying jobs and
+  also terminates the child process for running ones, discarding files. `__init__` **migrates a
+  pre-existing `jobs` table** (adds `retry_count`/`next_retry_at`) and seeds the `app_state` table,
+  which holds the persistent global Pause/Play **valve** (`paused_all`). `UNIQUE(repo_type, slug)`
+  means one row per repo+type.
+- **`backup.py`** — the worker engine. A **central dispatcher** loop (`JobRunner.start()`) is the
+  only thing that starts downloads: while the valve is open and a slot is free (`running_count <
+  max_concurrent_jobs`) it claims the lowest-id eligible job (`queued`, or `retrying` whose backoff
+  elapsed) and submits it to a `ThreadPoolExecutor`. Endpoints/lifespan only write DB state.
+  `run_backup_job()` handles **one** repo: size it, run a **pre-flight disk-space check**, then run
+  `snapshot_download(..., max_workers=max_workers)` in a **terminable child process**
+  (`app/launcher.py`, `SubprocessLauncher`, spawn) so it can be paused/cancelled near-instantly even
+  mid-file. A `RunningRegistry` maps `job_id → handle`+intent (`pause`/`cancel`/`requeue`); the
+  worker performs the single terminal transition (`completed`/`paused`/`failed`/`retrying`, delete,
+  or requeue) after the child exits. Global pause (`pause_all`) closes the valve and requeues every
+  running job; `resume_all` reopens it.
+- **`main.py`** — HTTP API + serves the `static/` dashboard. The FastAPI **lifespan hook resets
+  orphaned `running` jobs to `queued` and starts the dispatcher** (the auto-resume mechanism, valve
+  permitting). Endpoints: `POST/GET /api/jobs`, `GET /api/storage` (includes `planned` and
+  `paused_all`), `POST /api/jobs/{id}/retry|pause|resume|cancel|delete`, and `POST
+  /api/pause-all|resume-all` (the global valve).
 
 ### Two things that are easy to get wrong
 

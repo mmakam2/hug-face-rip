@@ -12,6 +12,7 @@ from huggingface_hub.utils import (
 )
 
 from .db import PAUSED
+from .retry import is_retryable, BACKOFF_SECONDS, MAX_RETRIES
 
 REPO_TYPES = ["model", "dataset", "space"]
 
@@ -137,6 +138,25 @@ class RunningRegistry:
         for handle in handles:
             handle.terminate()
 
+    def request_all(self, intent) -> None:
+        """Record an intent for every running job and terminate each handle."""
+        with self._lock:
+            items = list(self._handles.items())
+            for job_id, _ in items:
+                self._intents[job_id] = intent
+        for _, handle in items:
+            handle.terminate()
+
+
+def _record_failure(store, job_id, retry_count, message, retryable) -> None:
+    """Either schedule an auto-retry (transient + budget remaining) or mark the
+    job permanently failed."""
+    msg = str(message)[:500]
+    if retryable and retry_count < MAX_RETRIES:
+        store.schedule_retry(job_id, msg, BACKOFF_SECONDS[retry_count])
+    else:
+        store.set_status(job_id, "failed", error=msg)
+
 
 def run_backup_job(job_id, store, settings, api=None, launcher=None,
                    stopping=None, registry=None) -> None:
@@ -188,8 +208,14 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
         )
         if registry is not None:
             registry.register(job_id, handle)
-            # Close the race where pause/cancel landed before registration.
-            if registry.intent(job_id) is not None:
+            # Close the race where a stop request landed between the dispatcher's
+            # claim and this registration: a per-job pause/cancel (intent already
+            # recorded), or a global pause that closed the valve while we were in
+            # preflight (request_all only reaches already-registered handles, so
+            # the worker must self-requeue here).
+            if store.get_flag("paused_all", "0") == "1":
+                registry.request(job_id, "requeue")
+            elif registry.intent(job_id) is not None:
                 handle.terminate()
 
         outcome = handle.wait()
@@ -203,42 +229,78 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
             final = directory_size(local_dir)
             store.update_progress(job_id, total if total else final, total_bytes=total)
             store.set_status(job_id, "completed")
+            store.reset_retry(job_id)
         elif intent == "pause":
             store.set_status(job_id, PAUSED)
         elif intent == "cancel":
             delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
             store.delete_job(job_id)
+        elif intent == "requeue":
+            # Global pause: stop and return to the queue (keep files), no retry change.
+            store.set_status(job_id, "queued")
         elif stopping is not None and stopping.is_set():
             # Process-wide shutdown terminated the child; leave the job 'running'
-            # so the startup re-queue resumes it instead of failing it.
+            # so the startup reset re-queues it instead of failing it.
             return
         else:
-            err = outcome.error if outcome is not None else \
-                f"download process exited unexpectedly (code {handle.exitcode})"
-            store.set_status(job_id, "failed", error=str(err)[:500])
+            if outcome is not None:
+                message, retryable = outcome.error, outcome.retryable
+            else:
+                message = f"download process exited unexpectedly (code {handle.exitcode})"
+                retryable = True   # unexpected child exit (e.g. OOM) is worth a retry
+            _record_failure(store, job_id, job.retry_count, message, retryable)
     except Exception as exc:  # noqa: BLE001 - surface any pre-download failure
         stop.set()
         if poller.is_alive():
             poller.join(timeout=2)
         if stopping is not None and stopping.is_set():
             return
-        store.set_status(job_id, "failed", error=str(exc)[:500])
+        _record_failure(store, job_id, job.retry_count, str(exc), is_retryable(exc))
     finally:
         if registry is not None:
             registry.unregister(job_id)
 
 
+DISPATCH_INTERVAL = 1.0
+
+
 class JobRunner:
-    def __init__(self, store, settings, api=None, launcher=None) -> None:
+    def __init__(self, store, settings, api=None, launcher=None,
+                 dispatch_interval: float = DISPATCH_INTERVAL) -> None:
         self._store = store
         self._settings = settings
         self._api = api
         self._launcher = launcher
+        self._interval = dispatch_interval
         self._stopping = threading.Event()
         self._registry = RunningRegistry()
         self._executor = ThreadPoolExecutor(max_workers=settings.max_concurrent_jobs)
+        self._dispatcher = None
 
-    def submit(self, job_id) -> None:
+    def start(self) -> None:
+        """Start the dispatcher daemon (idempotent). It is the only thing that
+        starts downloads: while the valve is open and a slot is free it claims and
+        runs the lowest-id eligible job."""
+        if self._dispatcher is not None:
+            return
+        self._dispatcher = threading.Thread(target=self._dispatch_loop, daemon=True)
+        self._dispatcher.start()
+
+    def _dispatch_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                if self._store.get_flag("paused_all", "0") != "1":   # valve open
+                    while self._store.running_count() < self._settings.max_concurrent_jobs:
+                        job = self._store.next_runnable_job()
+                        if job is None:
+                            break
+                        if self._store.claim(job.id):
+                            self._submit(job.id)
+            except Exception:  # noqa: BLE001 - the loop must never die
+                pass
+            self._stopping.wait(self._interval)
+
+    def _submit(self, job_id) -> None:
         self._executor.submit(
             run_backup_job, job_id, self._store, self._settings,
             self._api, self._launcher, self._stopping, self._registry,
@@ -253,11 +315,23 @@ class JobRunner:
         child dies. Returns True if a live download was terminated."""
         return self._registry.request(job_id, "cancel")
 
+    def pause_all(self) -> None:
+        """Close the global valve and return every running download to 'queued'
+        (keeping files). Per-job 'paused' jobs are untouched."""
+        self._store.set_flag("paused_all", "1")
+        self._registry.request_all("requeue")
+
+    def resume_all(self) -> None:
+        """Open the global valve; the dispatcher resumes held work by priority."""
+        self._store.set_flag("paused_all", "0")
+
     def shutdown(self, wait: bool = False) -> None:
-        """Stop the runner. Default (wait=False) is for process shutdown: signal
-        in-flight workers that we're stopping (so they leave their jobs resumable),
-        terminate their child processes, and cancel not-yet-started jobs (which
-        stay 'queued' for the next startup). wait=True drains to completion."""
+        """Stop the dispatcher and runner. Default (wait=False) is for process
+        shutdown: signal in-flight workers (so they leave jobs resumable),
+        terminate their child processes, and stop accepting new work. wait=True
+        drains running jobs to completion."""
         self._stopping.set()
+        if self._dispatcher is not None:
+            self._dispatcher.join(timeout=2)
         self._registry.terminate_all()
         self._executor.shutdown(wait=wait, cancel_futures=not wait)
