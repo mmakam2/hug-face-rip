@@ -6,9 +6,9 @@ live progress, and automatic resume.
 
 ## Setup
 
-1. Install dependencies:
+1. Install dependencies (use the venv interpreter — there is no system `python`):
    ```bash
-   python -m pip install -r requirements.txt
+   .venv/bin/python -m pip install -r requirements.txt
    ```
 2. Create a `.env` (see `.env.example`):
    ```
@@ -44,6 +44,12 @@ from another machine) and paste a repo slug (e.g. `bigscience/bloom`). Each repo
 is saved to `BACKUP_DIR/<repo_type>s/<owner>/<name>`. Closing and restarting the
 server resumes any in-flight backups automatically.
 
+Each row shows live progress, and a disk-usage bar shows current usage plus
+*planned* usage from queued and in-flight jobs (so you can see whether what's
+queued will fit). You can **retry** a failed backup, **cancel** a queued one, or
+**delete** a completed one (which removes its downloaded files and frees the
+space, after a confirmation).
+
 > **Security note:** binding to `0.0.0.0` exposes the dashboard to your whole
 > network. It has no authentication and triggers downloads using your Hugging
 > Face token, so only run it on a trusted network (or behind a firewall). To
@@ -64,20 +70,23 @@ sudo systemctl status hf-backup.service
 It restarts on failure and, because the app re-queues unfinished jobs on
 startup, an interrupted download resumes automatically.
 
-### Tuning for small / memory-constrained hosts
+### Tuning for memory (the Xet gotcha)
 
-The unit sets a few environment knobs that matter on low-RAM boxes (e.g. a
-small VM or LXC container):
+Hugging Face's Xet downloader (used by `snapshot_download` for Xet-backed repos)
+has adaptive concurrency that can balloon download buffers into the **gigabytes**
+and OOM-kill the process. The shipped unit is tuned for a host with ~10 GB RAM
+and handles this by **bounding** Xet rather than disabling it:
 
-- **`HF_HUB_DISABLE_XET=1`** — **important.** Hugging Face's Xet downloader
-  uses adaptive concurrency that ramps download buffers into the **gigabytes**,
-  which OOM-kills the process on a constrained host. Disabling it falls back to
-  plain HTTP streaming with near-constant (~100 MB) memory. Keep this set unless
-  the host has plenty of RAM headroom.
-- **`MAX_WORKERS` / `MAX_CONCURRENT_JOBS`** — lowered (2 / 1) to bound the number
-  of files downloaded in parallel.
-- **`MemoryMax=2560M`** — a hard cgroup cap so a runaway download is contained to
-  this service instead of taking down the whole host.
+- **`HF_XET_NUM_CONCURRENT_RANGE_GETS=8`** — caps Xet's concurrent range-gets
+  (default 16) so peak memory stays bounded (`MAX_WORKERS` files in flight ×
+  range-gets each). On a **small / memory-constrained** host, prefer
+  `HF_HUB_DISABLE_XET=1` instead — that falls back to plain HTTP streaming with
+  near-constant (~100 MB) memory. Do **not** set `HF_XET_HIGH_PERFORMANCE`; it is
+  the most memory-hungry mode.
+- **`MAX_CONCURRENT_JOBS` / `MAX_WORKERS`** — lowered to `1` / `2` to bound how
+  many repos, and how many files per repo, download in parallel.
+- **`MemoryMax=8G`** — a hard cgroup cap so a runaway download is contained to
+  this service instead of OOM-killing the whole box.
 
 The app also performs a **pre-flight disk-space check**: before downloading, it
 compares the repo's total size against free space in `BACKUP_DIR` and fails the

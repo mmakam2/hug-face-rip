@@ -44,8 +44,10 @@ Request/data flow across the four modules:
   token, creates/writes-checks `BACKUP_DIR`, raises `ConfigError` on bad input.
 - **`db.py`** — `JobStore` wraps **one** SQLite connection shared across threads (a `threading.Lock`
   guards every call; `check_same_thread=False`). `Job` has a computed `percent`. Status lifecycle:
-  `queued → running → completed | failed | cancelled`. `UNIQUE(repo_type, slug)` means one row per
-  repo+type, so re-adding a repo resumes/retries the existing job rather than duplicating it.
+  `queued → running → completed | failed`. (Cancelling a queued job and deleting a completed one
+  both remove the row outright; the `CANCELLED` constant is defined but no endpoint sets it.)
+  `UNIQUE(repo_type, slug)` means one row per repo+type, so re-adding a repo resumes/retries the
+  existing job rather than duplicating it.
 - **`backup.py`** — the worker engine. `JobRunner` holds a `ThreadPoolExecutor(max_workers=
   max_concurrent_jobs)` — this bounds how many **repos** download at once. `run_backup_job()`
   handles **one** repo: size it via `repo_total_bytes`, run a **pre-flight disk-space check**
@@ -53,7 +55,8 @@ Request/data flow across the four modules:
   max_workers=max_workers)` — which bounds parallel **files within** that repo.
 - **`main.py`** — HTTP API + serves the `static/` dashboard. The FastAPI **lifespan hook re-queues
   every unfinished job on startup**, which is the auto-resume mechanism. Endpoints: `POST/GET
-  /api/jobs`, `GET /api/storage`, `POST /api/jobs/{id}/retry|cancel`.
+  /api/jobs`, `GET /api/storage` (includes `planned` = queued + in-flight bytes still to download),
+  `POST /api/jobs/{id}/retry|cancel|delete` (`delete` removes a completed backup's files and row).
 
 ### Two things that are easy to get wrong
 
