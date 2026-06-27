@@ -51,3 +51,11 @@ def test_completed_rows_have_confirm_guarded_delete(client):
     page = client.get("/").text
     assert "confirmDelete" in page    # delete control wired into the row
     assert "confirm(" in page         # native confirmation before deleting
+
+
+def test_running_and_paused_rows_expose_pause_resume_cancel(client):
+    page = client.get("/").text
+    assert ">Pause<" in page          # running rows can be paused
+    assert ">Resume<" in page         # paused rows can be resumed
+    assert "confirmCancel" in page    # cancel is confirm-guarded (now destroys data)
+    assert ".st.paused" in page       # paused status has its own color rule
