@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .backup import JobRunner, detect_repo_types
+from .backup import JobRunner, detect_repo_types, repo_total_bytes
 from .config import load_settings
 from .db import FAILED, JobStore, QUEUED, RUNNING
 
@@ -21,7 +21,7 @@ class SlugIn(BaseModel):
     slug: str
 
 
-def create_app(settings, store, runner, detect=detect_repo_types) -> FastAPI:
+def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_total_bytes) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
         for job in store.unfinished_jobs():
@@ -49,6 +49,16 @@ def create_app(settings, store, runner, detect=detect_repo_types) -> FastAPI:
             existing = store.get_job_by_repo(repo_type, slug)
             if existing is None:
                 job = store.create_job(slug, repo_type)
+                # Populate the size up front so the queued row shows its total
+                # instead of 0. Best-effort: if the Hub lookup fails, queue the
+                # job anyway and let run_backup_job compute the size when it runs.
+                try:
+                    total = sizer(slug, repo_type, settings.hf_token)
+                except Exception:  # noqa: BLE001 - sizing must not block queuing
+                    total = 0
+                if total:
+                    store.update_progress(job.id, 0, total_bytes=total)
+                    job = store.get_job(job.id)
                 runner.submit(job.id)
             elif existing.status in (RUNNING, QUEUED):
                 # Already downloading or pending — don't start a second
