@@ -361,3 +361,33 @@ def test_worker_self_terminates_when_intent_set_before_registration(tmp_path):
 
     assert store.get_job(job.id) is None          # cancelled despite early intent
     store.close()
+
+
+def test_runner_pause_sets_job_paused(tmp_path):
+    settings = make_settings(tmp_path, max_jobs=1)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    started = threading.Event()
+    runner = JobRunner(store, settings, api=FakeApi(1000),
+                       launcher=InThreadLauncher(blocking_downloader_factory(started)))
+    runner.submit(job.id)
+    assert started.wait(3)
+    runner.pause(job.id)
+    assert wait_until(lambda: store.get_job(job.id).status == PAUSED)
+    runner.shutdown()
+    store.close()
+
+
+def test_runner_cancel_terminates_and_removes_job(tmp_path):
+    settings = make_settings(tmp_path, max_jobs=1)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    started = threading.Event()
+    runner = JobRunner(store, settings, api=FakeApi(1000),
+                       launcher=InThreadLauncher(blocking_downloader_factory(started)))
+    runner.submit(job.id)
+    assert started.wait(3)
+    assert runner.cancel(job.id) is True
+    assert wait_until(lambda: store.get_job(job.id) is None)
+    runner.shutdown()
+    store.close()

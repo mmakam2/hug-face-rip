@@ -223,25 +223,35 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
 
 
 class JobRunner:
-    def __init__(self, store, settings, api=None, downloader=None) -> None:
+    def __init__(self, store, settings, api=None, launcher=None) -> None:
         self._store = store
         self._settings = settings
         self._api = api
-        self._downloader = downloader
+        self._launcher = launcher
         self._stopping = threading.Event()
+        self._registry = RunningRegistry()
         self._executor = ThreadPoolExecutor(max_workers=settings.max_concurrent_jobs)
 
     def submit(self, job_id) -> None:
         self._executor.submit(
             run_backup_job, job_id, self._store, self._settings,
-            self._api, self._downloader, self._stopping,
+            self._api, self._launcher, self._stopping, self._registry,
         )
+
+    def pause(self, job_id) -> None:
+        """Stop a running download but keep its files (worker sets it 'paused')."""
+        self._registry.request(job_id, "pause")
+
+    def cancel(self, job_id) -> bool:
+        """Stop a running download; the worker deletes its files + row once the
+        child dies. Returns True if a live download was terminated."""
+        return self._registry.request(job_id, "cancel")
 
     def shutdown(self, wait: bool = False) -> None:
         """Stop the runner. Default (wait=False) is for process shutdown: signal
-        in-flight workers that we're stopping (so they leave their jobs resumable)
-        and cancel not-yet-started jobs (which stay 'queued' for the next startup
-        to resume) without blocking on the in-flight download. wait=True drains
-        every job to completion instead."""
+        in-flight workers that we're stopping (so they leave their jobs resumable),
+        terminate their child processes, and cancel not-yet-started jobs (which
+        stay 'queued' for the next startup). wait=True drains to completion."""
         self._stopping.set()
+        self._registry.terminate_all()
         self._executor.shutdown(wait=wait, cancel_futures=not wait)
