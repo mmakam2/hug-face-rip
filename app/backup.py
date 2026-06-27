@@ -208,8 +208,14 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
         )
         if registry is not None:
             registry.register(job_id, handle)
-            # Close the race where pause/cancel landed before registration.
-            if registry.intent(job_id) is not None:
+            # Close the race where a stop request landed between the dispatcher's
+            # claim and this registration: a per-job pause/cancel (intent already
+            # recorded), or a global pause that closed the valve while we were in
+            # preflight (request_all only reaches already-registered handles, so
+            # the worker must self-requeue here).
+            if store.get_flag("paused_all", "0") == "1":
+                registry.request(job_id, "requeue")
+            elif registry.intent(job_id) is not None:
                 handle.terminate()
 
         outcome = handle.wait()

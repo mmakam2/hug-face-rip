@@ -578,3 +578,23 @@ def test_pause_all_requeues_running_and_sets_flag(tmp_path):
     assert wait_until(lambda: store.get_job(job.id).status == QUEUED, timeout=5)
     runner.shutdown()
     store.close()
+
+
+def test_worker_requeues_when_valve_closes_during_preflight(tmp_path):
+    # Global-pause race: the valve closes after the dispatcher claimed this job
+    # but before the worker registered its handle. request_all can't reach an
+    # unregistered handle, so the worker must self-requeue from the valve flag
+    # rather than download to completion.
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    store.set_flag("paused_all", "1")            # valve already closed at register time
+    registry = RunningRegistry()
+    started = threading.Event()
+    run_backup_job(job.id, store, settings, api=FakeApi(1000),
+                   launcher=InThreadLauncher(blocking_downloader_factory(started)),
+                   registry=registry)
+    j = store.get_job(job.id)
+    assert j.status == QUEUED                     # requeued, not completed
+    assert (tmp_path / "backups" / "models" / "o" / "n" / "partial.bin").exists()
+    store.close()
