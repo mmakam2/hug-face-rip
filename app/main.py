@@ -1,3 +1,4 @@
+import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -96,3 +97,19 @@ def build_default_app() -> FastAPI:
     store = JobStore(settings.db_path)
     runner = JobRunner(store, settings)
     return create_app(settings, store, runner)
+
+
+def server_host_port(env=None):
+    """Resolve the server bind address. Defaults to all interfaces (0.0.0.0:8000);
+    override with the HOST and PORT environment variables."""
+    env = os.environ if env is None else env
+    host = env.get("HOST") or "0.0.0.0"
+    port = int(env.get("PORT") or "8000")
+    return host, port
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host, port = server_host_port()
+    uvicorn.run(build_default_app, host=host, port=port, factory=True)
