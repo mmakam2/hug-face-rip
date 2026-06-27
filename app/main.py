@@ -84,6 +84,7 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
             "total": usage.total,
             "used": usage.used,
             "free": usage.free,
+            "planned": store.pending_bytes(),
         }
 
     @app.post("/api/jobs/{job_id}/retry")

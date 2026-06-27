@@ -37,9 +37,12 @@ td{padding:12px 10px;border-top:1px solid var(--line);vertical-align:middle}
 .storage{display:flex;align-items:center;gap:16px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:13px 16px;margin:0 0 26px}
 .storage .slabel{font-size:13px;font-weight:600;white-space:nowrap}
 .storage .spath{color:var(--muted);font-weight:400;margin-left:8px}
-.storage .sbar{flex:1;height:8px;background:var(--line);border-radius:99px;overflow:hidden;min-width:80px}
-.storage .sbar>span{display:block;height:100%;background:var(--accent);transition:width .4s ease}
-.storage.full .sbar>span{background:var(--err)}
+.storage .sbar{flex:1;display:flex;height:8px;background:var(--line);border-radius:99px;overflow:hidden;min-width:80px}
+.storage .sbar>span{display:block;height:100%;transition:width .4s ease}
+.storage .sbar .sused{background:var(--accent)}
+.storage.full .sbar .sused{background:var(--err)}
+.storage .sbar .splanned{background:var(--ok)}
+.storage .sbar .splanned.over{background:var(--err)}
 .storage .sval{font-size:13px;color:var(--muted);white-space:nowrap}
 .storage .sval b{color:var(--fg);font-weight:600}
 </style>
@@ -107,13 +110,20 @@ function row(j) {
 async function loadStorage() {
   try {
     const s = await api("/api/storage");
-    const pct = s.total ? Math.min(100, Math.round((s.used / s.total) * 100)) : 0;
+    const total = s.total || 0;
+    const planned = s.planned || 0;
+    const usedPct = total ? Math.min(100, (s.used / total) * 100) : 0;
+    const over = s.used + planned > total;                 // projected usage won't fit
+    const plannedPct = total ? Math.max(0, Math.min((planned / total) * 100, 100 - usedPct)) : 0;
     const el = document.getElementById("storage");
-    el.classList.toggle("full", pct >= 90);
+    el.classList.toggle("full", usedPct >= 90);
+    const plannedTxt = planned
+      ? ` · <span style="color:${over ? "var(--err)" : "var(--ok)"}">+${fmt(planned)} planned${over ? ` · ⚠ ${fmt(s.used + planned - total)} over` : ""}</span>`
+      : "";
     el.innerHTML =
       `<div class="slabel">Backup disk<span class="spath">${esc(s.path)}</span></div>` +
-      `<div class="sbar"><span style="width:${pct}%"></span></div>` +
-      `<div class="sval"><b>${fmt(s.used)}</b> / ${fmt(s.total)} used · ${fmt(s.free)} free</div>`;
+      `<div class="sbar"><span class="sused" style="width:${usedPct}%"></span><span class="splanned${over ? " over" : ""}" style="width:${plannedPct}%"></span></div>` +
+      `<div class="sval"><b>${fmt(s.used)}</b> / ${fmt(s.total)} used · ${fmt(s.free)} free${plannedTxt}</div>`;
     el.hidden = false;
   } catch (e) { /* transient; keep polling */ }
 }

@@ -83,3 +83,17 @@ def test_to_dict_includes_percent(store):
     store.update_progress(job.id, 1, 4)
     d = store.get_job(job.id).to_dict()
     assert d["percent"] == 25.0 and d["slug"] == "a/b"
+
+
+def test_pending_bytes_sums_remaining_of_running_and_queued(store):
+    a = store.create_job("a/b", "model")          # queued
+    store.update_progress(a.id, 0, 100)            # remaining 100
+    b = store.create_job("c/d", "model")           # running
+    store.set_status(b.id, RUNNING)
+    store.update_progress(b.id, 30, 100)           # remaining 70
+    done = store.create_job("e/f", "model")        # completed -> excluded
+    store.set_status(done.id, COMPLETED)
+    store.update_progress(done.id, 100, 100)
+    over = store.create_job("g/h", "model")        # downloaded > total -> clamps to 0
+    store.update_progress(over.id, 120, 100)
+    assert store.pending_bytes() == 170            # 100 + 70 + 0
