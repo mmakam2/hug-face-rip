@@ -31,3 +31,10 @@ def test_index_served(client):
     assert resp.status_code == 200
     assert "Hugging Face Repo Backup" in resp.text
     assert "/api/jobs" in resp.text  # JS talks to the API
+
+
+def test_repo_type_rendered_as_colored_badge(client):
+    page = client.get("/").text
+    assert 'class="badge ' in page   # row template tags each job with a typed badge
+    for repo_type in ("model", "dataset", "space"):
+        assert f".badge.{repo_type}" in page  # per-type color rule exists
