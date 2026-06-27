@@ -206,3 +206,55 @@ def test_migration_adds_columns_to_old_db(tmp_path):
     assert job is not None and job.retry_count == 0 and job.next_retry_at is None
     assert store.get_flag("paused_all", "0") == "0"
     store.close()
+
+
+def test_running_count_includes_verifying(store):
+    a = store.create_job("a/b", "model")
+    store.set_status(a.id, "running")
+    b = store.create_job("c/d", "model")
+    store.set_status(b.id, "verifying")
+    assert store.running_count() == 2
+
+
+def test_set_verify_status_persists(store):
+    j = store.create_job("a/b", "model")
+    assert store.get_job(j.id).verify_status == "unverified"   # default
+    assert store.get_job(j.id).verify_detail is None
+    store.set_verify_status(j.id, "corrupted", detail='{"failures": []}')
+    g = store.get_job(j.id)
+    assert g.verify_status == "corrupted"
+    assert g.verify_detail == '{"failures": []}'
+    assert "verify_status" in g.to_dict() and "verify_detail" in g.to_dict()
+
+
+def test_reset_verifying_to_completed(store):
+    j = store.create_job("a/b", "model")
+    store.set_status(j.id, "verifying")
+    store.update_progress(j.id, 5, total_bytes=10)
+    store.reset_verifying_to_completed()
+    g = store.get_job(j.id)
+    assert g.status == "completed"
+    assert g.verify_status == "unverified"
+    assert g.downloaded_bytes == 10        # bar restored to total
+
+
+def test_migration_adds_verify_columns_to_old_db(tmp_path):
+    import sqlite3
+    dbp = tmp_path / "old.db"
+    con = sqlite3.connect(dbp)
+    con.executescript(
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL,"
+        " repo_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',"
+        " total_bytes INTEGER NOT NULL DEFAULT 0, downloaded_bytes INTEGER NOT NULL DEFAULT 0,"
+        " error TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        " updated_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(repo_type, slug));"
+    )
+    con.execute("INSERT INTO jobs (slug, repo_type, status) VALUES ('keep/me','model','completed')")
+    con.commit(); con.close()
+
+    store = JobStore(dbp)
+    job = store.get_job_by_repo("model", "keep/me")
+    assert job is not None
+    assert job.verify_status == "unverified"
+    assert job.verify_detail is None
+    store.close()

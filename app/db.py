@@ -10,6 +10,7 @@ FAILED = "failed"
 PAUSED = "paused"
 RETRYING = "retrying"
 CANCELLED = "cancelled"
+VERIFYING = "verifying"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -22,6 +23,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     error TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     next_retry_at TEXT,
+    verify_status TEXT NOT NULL DEFAULT 'unverified',
+    verify_detail TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(repo_type, slug)
@@ -46,6 +49,8 @@ class Job:
     updated_at: str
     retry_count: int = 0
     next_retry_at: Optional[str] = None
+    verify_status: str = "unverified"
+    verify_detail: Optional[str] = None
 
     @property
     def percent(self) -> float:
@@ -71,6 +76,11 @@ class JobStore:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
         if "next_retry_at" not in cols:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN next_retry_at TEXT")
+        if "verify_status" not in cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN verify_status TEXT NOT NULL DEFAULT 'unverified'")
+        if "verify_detail" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN verify_detail TEXT")
         self._conn.execute("INSERT OR IGNORE INTO app_state (key, value) VALUES ('paused_all', '0')")
         self._conn.commit()
 
@@ -125,6 +135,28 @@ class JobStore:
             )
             self._conn.commit()
 
+    def set_verify_status(self, job_id: int, verify_status: str,
+                          detail: Optional[str] = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET verify_status = ?, verify_detail = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (verify_status, detail, job_id),
+            )
+            self._conn.commit()
+
+    def reset_verifying_to_completed(self) -> None:
+        """On startup, a job orphaned mid-verification (process died) lands back
+        at 'completed' + 'unverified' with its bar restored — the download itself
+        was already complete, so it is never re-queued for download."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET status = 'completed', verify_status = 'unverified', "
+                "downloaded_bytes = total_bytes, updated_at = datetime('now') "
+                "WHERE status = 'verifying'"
+            )
+            self._conn.commit()
+
     def requeue(self, job_id: int) -> None:
         with self._lock:
             self._conn.execute(
@@ -141,7 +173,7 @@ class JobStore:
     def running_count(self) -> int:
         with self._lock:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status = 'running'"
+                "SELECT COUNT(*) FROM jobs WHERE status IN ('running', 'verifying')"
             ).fetchone()
         return row[0]
 
