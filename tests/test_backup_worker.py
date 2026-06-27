@@ -87,6 +87,27 @@ def test_worker_skips_cancelled_job(tmp_path):
     store.close()
 
 
+def test_worker_marks_failed_when_sizing_fails(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+
+    class FailingApi:
+        def repo_info(self, *args, **kwargs):
+            raise RuntimeError("size lookup failed")
+
+    called = []
+    def downloader(**kwargs):
+        called.append(True)
+
+    run_backup_job(job.id, store, settings, api=FailingApi(), downloader=downloader)
+    failed = store.get_job(job.id)
+    assert failed.status == FAILED
+    assert "size lookup failed" in failed.error
+    assert called == []   # download never ran because sizing failed first
+    store.close()
+
+
 def test_runner_runs_job_to_completion(tmp_path):
     settings = make_settings(tmp_path, max_jobs=1)
     store = JobStore(settings.db_path)

@@ -90,7 +90,8 @@ def run_backup_job(job_id, store, settings, api=None, downloader=None) -> None:
         store.set_status(job_id, "completed")
     except Exception as exc:  # noqa: BLE001 - surface any failure on the job
         stop.set()
-        poller.join(timeout=2)
+        if poller.is_alive():
+            poller.join(timeout=2)
         store.set_status(job_id, "failed", error=str(exc)[:500])
 
 
