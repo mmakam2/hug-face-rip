@@ -1,6 +1,6 @@
 import sqlite3
 import pytest
-from app.db import JobStore, Job, QUEUED, RUNNING, COMPLETED, FAILED
+from app.db import JobStore, Job, QUEUED, RUNNING, COMPLETED, FAILED, PAUSED
 
 
 @pytest.fixture
@@ -105,3 +105,18 @@ def test_pending_bytes_sums_remaining_of_running_and_queued(store):
     over = store.create_job("g/h", "model")        # downloaded > total -> clamps to 0
     store.update_progress(over.id, 120, 100)
     assert store.pending_bytes() == 170            # 100 + 70 + 0
+
+
+def test_paused_excluded_from_unfinished_jobs(store):
+    a = store.create_job("a/b", "model")              # queued -> resumable on restart
+    p = store.create_job("c/d", "dataset")
+    store.set_status(p.id, PAUSED)                     # paused -> must NOT auto-resume
+    ids = {j.id for j in store.unfinished_jobs()}
+    assert ids == {a.id}
+
+
+def test_paused_excluded_from_pending_bytes(store):
+    p = store.create_job("c/d", "model")
+    store.set_status(p.id, PAUSED)
+    store.update_progress(p.id, 30, 100)              # 70 remaining, but paused
+    assert store.pending_bytes() == 0                 # paused bytes are not "planned"

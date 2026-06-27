@@ -7,6 +7,7 @@ QUEUED = "queued"
 RUNNING = "running"
 COMPLETED = "completed"
 FAILED = "failed"
+PAUSED = "paused"
 CANCELLED = "cancelled"
 
 _SCHEMA = """
