@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .backup import JobRunner, detect_repo_types, repo_total_bytes, delete_backup_files
 from .config import load_settings
-from .db import COMPLETED, FAILED, JobStore, PAUSED, QUEUED, RETRYING, RUNNING
+from .db import COMPLETED, FAILED, JobStore, PAUSED, QUEUED, RETRYING, RUNNING, VERIFYING
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -27,6 +27,7 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         # Orphaned 'running' jobs (their processes died with the old interpreter)
         # go back to 'queued'; the dispatcher then drives everything per the valve.
         store.reset_running_to_queued()
+        store.reset_verifying_to_completed()
         runner.start()
         yield
         # On shutdown (e.g. systemd restart), stop the dispatcher and terminate
@@ -143,6 +144,39 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
         store.delete_job(job_id)
         return {"deleted": job_id}
+
+    @app.post("/api/jobs/{job_id}/verify")
+    def verify(job_id: int):
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.status != COMPLETED:
+            raise HTTPException(status_code=409, detail="only completed downloads can be verified")
+        runner.verify(job_id)
+        return {"verifying": job_id}
+
+    @app.post("/api/jobs/{job_id}/stop-verify")
+    def stop_verify(job_id: int):
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.status != VERIFYING:
+            raise HTTPException(status_code=409, detail="only verifying jobs can be stopped")
+        runner.stop_verify(job_id)
+        return {"stopping": job_id}
+
+    @app.post("/api/jobs/{job_id}/redownload")
+    def redownload(job_id: int):
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.verify_status != "corrupted":
+            raise HTTPException(status_code=409, detail="only corrupted downloads can be re-downloaded")
+        delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
+        store.requeue(job_id)
+        store.reset_retry(job_id)
+        store.set_verify_status(job_id, "unverified", detail=None)
+        return store.get_job(job_id).to_dict()
 
     @app.post("/api/pause-all")
     def pause_all():

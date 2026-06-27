@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from app.config import Settings
-from app.db import JobStore, FAILED, QUEUED, PAUSED, RUNNING, RETRYING
+from app.db import JobStore, FAILED, QUEUED, PAUSED, RUNNING, RETRYING, COMPLETED, VERIFYING
 from app.main import create_app
 
 
@@ -13,6 +13,8 @@ class FakeRunner:
         self.paused_all = 0
         self.resumed_all = 0
         self.shutdowns = 0
+        self.verified = []
+        self.stop_verified = []
 
     def start(self):
         self.started = True
@@ -23,6 +25,12 @@ class FakeRunner:
     def cancel(self, job_id):
         self.cancelled.append(job_id)
         return True
+
+    def verify(self, job_id):
+        self.verified.append(job_id)
+
+    def stop_verify(self, job_id):
+        self.stop_verified.append(job_id)
 
     def pause_all(self):
         self.paused_all += 1
@@ -399,3 +407,79 @@ def test_retry_resets_retry_count(ctx):
     assert resp.status_code == 200
     j = store.get_job(job.id)
     assert j.status == QUEUED and j.retry_count == 0
+
+
+def test_verify_only_completed(ctx):
+    client, store, runner = ctx
+    job = store.create_job("a/b", "model")
+    assert client.post(f"/api/jobs/{job.id}/verify").status_code == 409   # queued
+    store.set_status(job.id, COMPLETED)
+    resp = client.post(f"/api/jobs/{job.id}/verify")
+    assert resp.status_code == 200
+    assert job.id in runner.verified
+
+
+def test_verify_missing_job_404(ctx):
+    client, store, runner = ctx
+    assert client.post("/api/jobs/999/verify").status_code == 404
+
+
+def test_stop_verify_only_verifying(ctx):
+    client, store, runner = ctx
+    job = store.create_job("a/b", "model")
+    store.set_status(job.id, COMPLETED)
+    assert client.post(f"/api/jobs/{job.id}/stop-verify").status_code == 409
+    store.set_status(job.id, VERIFYING)
+    resp = client.post(f"/api/jobs/{job.id}/stop-verify")
+    assert resp.status_code == 200
+    assert job.id in runner.stop_verified
+
+
+def test_redownload_only_corrupted_deletes_and_requeues(ctx, tmp_path):
+    client, store, runner = ctx
+    from app.backup import local_dir_for
+    backup = tmp_path / "backups"
+    job = store.create_job("o/n", "model")
+    d = local_dir_for(backup, "model", "o/n")
+    d.mkdir(parents=True)
+    (d / "model.bin").write_bytes(b"corrupt")
+    store.set_status(job.id, COMPLETED)
+    assert client.post(f"/api/jobs/{job.id}/redownload").status_code == 409   # not corrupted
+    store.set_verify_status(job.id, "corrupted", detail='{"failures": []}')
+    resp = client.post(f"/api/jobs/{job.id}/redownload")
+    assert resp.status_code == 200
+    j = store.get_job(job.id)
+    assert j.status == QUEUED
+    assert j.verify_status == "unverified"
+    assert j.verify_detail is None
+    assert not d.exists()                          # corrupt files discarded
+
+
+def test_redownload_missing_job_404(ctx):
+    client, store, runner = ctx
+    assert client.post("/api/jobs/999/redownload").status_code == 404
+
+
+def test_verify_fields_in_list(ctx):
+    client, store, runner = ctx
+    store.create_job("a/b", "model")
+    j = client.get("/api/jobs").json()["jobs"][0]
+    assert j["verify_status"] == "unverified"
+    assert j["verify_detail"] is None
+
+
+def test_startup_resets_orphaned_verifying(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(settings.db_path)
+    j = store.create_job("v/me", "model")
+    store.set_status(j.id, VERIFYING)
+    store.update_progress(j.id, 3, total_bytes=10)
+    runner = FakeRunner()
+    app = create_app(settings, store, runner, detect=lambda s, t: [])
+    with TestClient(app):
+        pass
+    g = store.get_job(j.id)
+    assert g.status == COMPLETED and g.verify_status == "unverified"
+    assert g.downloaded_bytes == 10
+    store.close()
