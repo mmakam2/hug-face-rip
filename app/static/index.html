@@ -53,6 +53,7 @@ const fmt = b => {
   const i = Math.min(u.length - 1, Math.floor(Math.log(b) / Math.log(1024)));
   return (b / Math.pow(1024, i)).toFixed(i ? 1 : 0) + " " + u[i];
 };
+const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) {
@@ -84,8 +85,8 @@ function row(j) {
     ? `<button class="ghost" onclick="act(${j.id},'cancel')">Cancel</button>`
     : "";
   return `<tr>
-    <td><div class="repo">${j.slug}</div><div class="type">${j.repo_type}</div>${j.error ? `<div class="err">${j.error}</div>` : ""}</td>
-    <td><span class="st ${j.status}">${j.status}</span></td>
+    <td><div class="repo">${esc(j.slug)}</div><div class="type">${esc(j.repo_type)}</div>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</td>
+    <td><span class="st ${esc(j.status)}">${esc(j.status)}</span></td>
     <td><div class="bar"><span style="width:${j.percent}%"></span></div><div class="type">${j.percent}%</div></td>
     <td class="size">${fmt(j.downloaded_bytes)} / ${fmt(j.total_bytes)}</td>
     <td>${actions}</td></tr>`;
