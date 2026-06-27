@@ -78,6 +78,14 @@ def test_unfinished_jobs(store):
     assert ids == {a.id, b.id}
 
 
+def test_list_jobs_orders_earliest_added_first(store):
+    a = store.create_job("a/b", "model")
+    b = store.create_job("c/d", "dataset")
+    c = store.create_job("e/f", "space")
+    ids = [j.id for j in store.list_jobs()]
+    assert ids == [a.id, b.id, c.id]   # earliest added at top, latest at bottom
+
+
 def test_to_dict_includes_percent(store):
     job = store.create_job("a/b", "model")
     store.update_progress(job.id, 1, 4)

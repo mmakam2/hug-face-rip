@@ -4,6 +4,8 @@ A small FastAPI web app that backs up entire Hugging Face Hub repositories
 (models, datasets, spaces) to a local folder — with bounded concurrency,
 live progress, and automatic resume.
 
+![The Hugging Face Rip dashboard](docs/images/dashboard.png)
+
 ## Setup
 
 1. Install dependencies (use the venv interpreter — there is no system `python`):

@@ -83,7 +83,7 @@ class JobStore:
 
     def list_jobs(self) -> List[Job]:
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM jobs ORDER BY id DESC").fetchall()
+            rows = self._conn.execute("SELECT * FROM jobs ORDER BY id ASC").fetchall()
         return [self._to_job(r) for r in rows]
 
     def update_progress(self, job_id: int, downloaded_bytes: int, total_bytes: Optional[int] = None) -> None:
