@@ -1,3 +1,4 @@
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -48,6 +49,18 @@ def directory_size(path: Path) -> int:
     return total
 
 
+def free_disk_bytes(path) -> int:
+    """Free bytes on the filesystem that holds ``path``.
+
+    The target directory may not exist yet, so walk up to the nearest existing
+    ancestor before asking the OS.
+    """
+    p = Path(path)
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    return shutil.disk_usage(p).free
+
+
 POLL_INTERVAL = 1.5
 
 
@@ -77,7 +90,19 @@ def run_backup_job(job_id, store, settings, api=None, downloader=None) -> None:
             raise ValueError(f"refusing to write outside backup dir: {local_dir}")
         local_dir.mkdir(parents=True, exist_ok=True)
         total = repo_total_bytes(job.slug, job.repo_type, settings.hf_token, api=api)
-        store.update_progress(job_id, directory_size(local_dir), total_bytes=total)
+        already = directory_size(local_dir)
+        store.update_progress(job_id, already, total_bytes=total)
+
+        # Pre-flight: refuse a download that cannot physically fit, instead of
+        # filling the disk / exhausting memory and getting OOM-killed mid-run.
+        free = free_disk_bytes(settings.backup_dir)
+        remaining = total - already
+        if total and remaining > free:
+            raise RuntimeError(
+                f"not enough disk space for {job.slug}: needs ~{remaining / 1e9:.1f} GB "
+                f"more, only {free / 1e9:.1f} GB free in {settings.backup_dir}"
+            )
+
         poller.start()
         downloader(
             repo_id=job.slug,
