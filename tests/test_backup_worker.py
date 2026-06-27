@@ -3,9 +3,11 @@ import time
 from pathlib import Path
 import pytest
 from app.config import Settings
-from app.db import JobStore, COMPLETED, FAILED, CANCELLED, RUNNING, PAUSED
+import socket
+from app.db import JobStore, COMPLETED, FAILED, CANCELLED, RUNNING, PAUSED, QUEUED, RETRYING
 from app.backup import run_backup_job, JobRunner, RunningRegistry
 from app.launcher import Outcome
+from app.retry import is_retryable, BACKOFF_SECONDS, MAX_RETRIES
 
 
 # --- in-thread fake launcher: mirrors ProcessHandle without a real process ---
@@ -49,7 +51,8 @@ class InThreadLauncher:
                 self._fn(stop=stop, **kwargs)
                 result["outcome"] = Outcome(ok=True)
             except BaseException as exc:  # noqa: BLE001
-                result["outcome"] = Outcome(ok=False, error=str(exc))
+                result["outcome"] = Outcome(ok=False, error=str(exc),
+                                            retryable=is_retryable(exc))
 
         t = threading.Thread(target=run)
         t.start()
@@ -378,35 +381,41 @@ def test_runner_pause_sets_job_paused(tmp_path):
     store.close()
 
 
-def test_worker_marks_failed_on_unexpected_process_exit(tmp_path):
-    # Covers the 'outcome is None' branch: child process exited without reporting
-    # any outcome (e.g. OOM-killed by the kernel).  run_backup_job must set the
-    # job to FAILED with a message mentioning 'exited unexpectedly' and the exit code.
-    # Uses a minimal fake launcher/handle — does NOT touch InThreadLauncher/_FakeHandle.
+class _OomHandle:
+    exitcode = -9
+    def terminate(self): pass
+    def wait(self, timeout=None): return None   # killed, reported nothing
+
+
+class _OomLauncher:
+    def start(self, **kwargs):
+        Path(kwargs["local_dir"]).mkdir(parents=True, exist_ok=True)
+        return _OomHandle()
+
+
+def test_worker_unexpected_exit_schedules_retry_when_budget_remains(tmp_path):
+    # An 'outcome is None' exit (child killed, e.g. OOM) is treated as retryable:
+    # with budget left it goes to RETRYING, not FAILED.
     settings = make_settings(tmp_path)
     store = JobStore(settings.db_path)
     job = store.create_job("o/n", "model")
-
-    class _OomHandle:
-        exitcode = -9
-
-        def terminate(self):
-            pass
-
-        def wait(self, timeout=None):
-            return None   # no outcome: child was killed externally
-
-    class _OomLauncher:
-        def start(self, **kwargs):
-            (Path(kwargs["local_dir"])).mkdir(parents=True, exist_ok=True)
-            return _OomHandle()
-
     run_backup_job(job.id, store, settings, api=FakeApi(10), launcher=_OomLauncher(),
                    registry=None)
-    failed = store.get_job(job.id)
-    assert failed.status == FAILED
-    assert "exited unexpectedly" in (failed.error or "")
-    assert "-9" in (failed.error or "")
+    j = store.get_job(job.id)
+    assert j.status == RETRYING and j.retry_count == 1 and j.next_retry_at is not None
+    store.close()
+
+
+def test_worker_unexpected_exit_fails_when_retries_exhausted(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    for _ in range(MAX_RETRIES):
+        store.schedule_retry(job.id, "x", 0)         # retry_count -> 5
+    assert store.get_job(job.id).retry_count == MAX_RETRIES
+    run_backup_job(job.id, store, settings, api=FakeApi(10), launcher=_OomLauncher(),
+                   registry=None)
+    assert store.get_job(job.id).status == FAILED
     store.close()
 
 
@@ -422,4 +431,81 @@ def test_runner_cancel_terminates_and_removes_job(tmp_path):
     assert runner.cancel(job.id) is True
     assert wait_until(lambda: store.get_job(job.id) is None)
     runner.shutdown()
+    store.close()
+
+
+def transient_downloader(*, local_dir, stop=None, **_):
+    raise socket.gaierror(-3, "Temporary failure in name resolution")
+
+
+def test_worker_retries_transient_download_failure(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    run_backup_job(job.id, store, settings, api=FakeApi(10),
+                   launcher=InThreadLauncher(transient_downloader), registry=None)
+    j = store.get_job(job.id)
+    assert j.status == RETRYING and j.retry_count == 1
+    assert j.next_retry_at is not None
+    assert "name resolution" in (j.error or "")
+    store.close()
+
+
+def test_worker_permanent_failure_does_not_retry(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+
+    def boom(*, local_dir, stop=None, **_):
+        raise RuntimeError("403 gated")
+
+    run_backup_job(job.id, store, settings, api=FakeApi(10),
+                   launcher=InThreadLauncher(boom), registry=None)
+    j = store.get_job(job.id)
+    assert j.status == FAILED and j.retry_count == 0
+    store.close()
+
+
+def test_worker_completion_resets_retry_count(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    store.schedule_retry(job.id, "earlier blip", 0)      # retry_count -> 1
+    run_backup_job(job.id, store, settings, api=FakeApi(11),
+                   launcher=InThreadLauncher(fake_downloader_factory(b"y" * 11)),
+                   registry=None)
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED and j.retry_count == 0 and j.next_retry_at is None
+    store.close()
+
+
+def test_worker_requeue_intent_returns_job_to_queued_keeping_files(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    registry = RunningRegistry()
+    started = threading.Event()
+    t = threading.Thread(target=run_backup_job, kwargs=dict(
+        job_id=job.id, store=store, settings=settings, api=FakeApi(1000),
+        launcher=InThreadLauncher(blocking_downloader_factory(started)),
+        registry=registry))
+    t.start()
+    assert started.wait(3)
+    registry.request(job.id, "requeue")
+    t.join(5)
+    j = store.get_job(job.id)
+    assert j.status == QUEUED
+    assert (tmp_path / "backups" / "models" / "o" / "n" / "partial.bin").exists()
+    store.close()
+
+
+def test_worker_preflight_disk_failure_is_permanent(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    monkeypatch.setattr("app.backup.free_disk_bytes", lambda p: 1000)
+    run_backup_job(job.id, store, settings, api=FakeApi(1_000_000_000),
+                   launcher=InThreadLauncher(fake_downloader_factory(b"x")), registry=None)
+    j = store.get_job(job.id)
+    assert j.status == FAILED and j.retry_count == 0   # disk-full is not retried
     store.close()

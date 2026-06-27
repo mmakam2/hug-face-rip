@@ -12,6 +12,7 @@ from huggingface_hub.utils import (
 )
 
 from .db import PAUSED
+from .retry import is_retryable, BACKOFF_SECONDS, MAX_RETRIES
 
 REPO_TYPES = ["model", "dataset", "space"]
 
@@ -138,6 +139,16 @@ class RunningRegistry:
             handle.terminate()
 
 
+def _record_failure(store, job_id, retry_count, message, retryable) -> None:
+    """Either schedule an auto-retry (transient + budget remaining) or mark the
+    job permanently failed."""
+    msg = str(message)[:500]
+    if retryable and retry_count < MAX_RETRIES:
+        store.schedule_retry(job_id, msg, BACKOFF_SECONDS[retry_count])
+    else:
+        store.set_status(job_id, "failed", error=msg)
+
+
 def run_backup_job(job_id, store, settings, api=None, launcher=None,
                    stopping=None, registry=None) -> None:
     if launcher is None:
@@ -203,26 +214,33 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
             final = directory_size(local_dir)
             store.update_progress(job_id, total if total else final, total_bytes=total)
             store.set_status(job_id, "completed")
+            store.reset_retry(job_id)
         elif intent == "pause":
             store.set_status(job_id, PAUSED)
         elif intent == "cancel":
             delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
             store.delete_job(job_id)
+        elif intent == "requeue":
+            # Global pause: stop and return to the queue (keep files), no retry change.
+            store.set_status(job_id, "queued")
         elif stopping is not None and stopping.is_set():
             # Process-wide shutdown terminated the child; leave the job 'running'
-            # so the startup re-queue resumes it instead of failing it.
+            # so the startup reset re-queues it instead of failing it.
             return
         else:
-            err = outcome.error if outcome is not None else \
-                f"download process exited unexpectedly (code {handle.exitcode})"
-            store.set_status(job_id, "failed", error=str(err)[:500])
+            if outcome is not None:
+                message, retryable = outcome.error, outcome.retryable
+            else:
+                message = f"download process exited unexpectedly (code {handle.exitcode})"
+                retryable = True   # unexpected child exit (e.g. OOM) is worth a retry
+            _record_failure(store, job_id, job.retry_count, message, retryable)
     except Exception as exc:  # noqa: BLE001 - surface any pre-download failure
         stop.set()
         if poller.is_alive():
             poller.join(timeout=2)
         if stopping is not None and stopping.is_set():
             return
-        store.set_status(job_id, "failed", error=str(exc)[:500])
+        _record_failure(store, job_id, job.retry_count, str(exc), is_retryable(exc))
     finally:
         if registry is not None:
             registry.unregister(job_id)
