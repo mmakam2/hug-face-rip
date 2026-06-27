@@ -53,3 +53,19 @@ def test_invalid_integer_raises(tmp_path):
     env = base_env(tmp_path) | {"MAX_CONCURRENT_JOBS": "notanumber"}
     with pytest.raises(ConfigError):
         load_settings(env)
+
+
+def test_verify_downloads_defaults_on(tmp_path):
+    s = load_settings(base_env(tmp_path))
+    assert s.verify_downloads is True
+
+
+def test_verify_downloads_disabled_by_env(tmp_path):
+    for val in ("0", "false", "no", "off", "FALSE"):
+        s = load_settings(base_env(tmp_path) | {"VERIFY_DOWNLOADS": val})
+        assert s.verify_downloads is False, val
+
+
+def test_verify_downloads_enabled_by_env(tmp_path):
+    s = load_settings(base_env(tmp_path) | {"VERIFY_DOWNLOADS": "1"})
+    assert s.verify_downloads is True
