@@ -86,6 +86,37 @@ def test_directory_size_missing_path_is_zero(tmp_path):
     assert directory_size(tmp_path / "nope") == 0
 
 
+def test_directory_size_survives_file_vanishing_between_is_file_and_stat(tmp_path):
+    # The real poller-vs-cancel race: a file passes is_file() (still present),
+    # then the cancel path's rmtree removes it before directory_size reads its
+    # size, so item.stat().st_size raises FileNotFoundError mid-walk. Without the
+    # OSError guard in directory_size this propagates and crashes the daemon
+    # poller; with it, the vanished file is skipped and survivors are still summed.
+    import unittest.mock as _mock
+    from pathlib import Path
+
+    (tmp_path / "a.bin").write_bytes(b"x" * 20)
+    (tmp_path / "b.bin").write_bytes(b"y" * 5)
+
+    real_stat = Path.stat
+    stat_calls = {}
+
+    def flaky_stat(self, *args, **kwargs):
+        if self.name == "b.bin":
+            # 1st stat call is is_file()'s (let it pass so the file looks present);
+            # 2nd is the st_size read — raise, simulating the file vanishing in
+            # exactly that window.
+            stat_calls["b"] = stat_calls.get("b", 0) + 1
+            if stat_calls["b"] >= 2:
+                raise FileNotFoundError(f"[Errno 2] No such file: '{self}'")
+        return real_stat(self, *args, **kwargs)
+
+    with _mock.patch.object(Path, "stat", flaky_stat):
+        result = directory_size(tmp_path)
+
+    assert result == 20   # b.bin vanished before its size was read; only a.bin counted
+
+
 def test_delete_backup_files_removes_dir_within_backup(tmp_path):
     backup = tmp_path / "backups"
     d = local_dir_for(backup, "model", "owner/name")

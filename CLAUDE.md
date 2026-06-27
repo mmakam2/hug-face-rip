@@ -34,7 +34,7 @@ Integration tests are **excluded by default** (`pytest.ini` sets `-m "not integr
 ## Architecture
 
 The app is built around **dependency injection so tests never hit the network**. `create_app()`,
-`JobRunner`, and `run_backup_job()` all accept injected collaborators (`api`, `downloader`,
+`JobRunner`, and `run_backup_job()` all accept injected collaborators (`api`, `launcher`,
 `detect`); `build_default_app()` is the only place that wires the real `HfApi` /
 `snapshot_download`. Tests pass fakes — that's why the default suite runs offline.
 
@@ -44,15 +44,21 @@ Request/data flow across the four modules:
   token, creates/writes-checks `BACKUP_DIR`, raises `ConfigError` on bad input.
 - **`db.py`** — `JobStore` wraps **one** SQLite connection shared across threads (a `threading.Lock`
   guards every call; `check_same_thread=False`). `Job` has a computed `percent`. Status lifecycle:
-  `queued → running → completed | failed`. (Cancelling a queued job and deleting a completed one
-  both remove the row outright; the `CANCELLED` constant is defined but no endpoint sets it.)
+  `queued → running → completed | failed | paused`; paused jobs are excluded from startup
+  re-queuing and can be resumed manually. Cancelling removes the row for queued jobs and also
+  terminates the child process and discards downloaded files for running or paused jobs.
   `UNIQUE(repo_type, slug)` means one row per repo+type, so re-adding a repo resumes/retries the
   existing job rather than duplicating it.
 - **`backup.py`** — the worker engine. `JobRunner` holds a `ThreadPoolExecutor(max_workers=
   max_concurrent_jobs)` — this bounds how many **repos** download at once. `run_backup_job()`
   handles **one** repo: size it via `repo_total_bytes`, run a **pre-flight disk-space check**
   (fails cleanly rather than filling the disk / OOMing), then call `snapshot_download(...,
-  max_workers=max_workers)` — which bounds parallel **files within** that repo.
+  max_workers=max_workers)` — which bounds parallel **files within** that repo. Each download
+  now runs in a **terminable child process** (`app/launcher.py`, `SubprocessLauncher`, spawn
+  start method) so a running download can be paused or cancelled near-instantly even mid-file;
+  a `RunningRegistry` on `JobRunner` maps `job_id → handle`+intent, and the worker performs
+  the single terminal transition (`paused`, delete-on-cancel, or `completed`/`failed`) after
+  the child exits.
 - **`main.py`** — HTTP API + serves the `static/` dashboard. The FastAPI **lifespan hook re-queues
   every unfinished job on startup**, which is the auto-resume mechanism. Endpoints: `POST/GET
   /api/jobs`, `GET /api/storage` (includes `planned` = queued + in-flight bytes still to download),
@@ -89,6 +95,13 @@ small host, set `HF_HUB_DISABLE_XET=1` (plain HTTP, ~near-constant memory). On a
 headroom, leave Xet enabled but bound it with `HF_XET_NUM_CONCURRENT_RANGE_GETS` (and keep
 `MemoryMax` as a cgroup backstop). **Do not** set `HF_XET_HIGH_PERFORMANCE` — it saturates network
 and all cores and is the most memory-hungry mode.
+
+**Subprocess memory model (post pause/resume):** Each concurrent download now runs in its own
+spawned Python child process, so `MAX_CONCURRENT_JOBS` multiplies whole-process baseline memory
+(including `hf_xet` buffer pools), not just per-thread buffers — plan headroom accordingly.
+`MemoryMax` still bounds the total because child processes inherit the parent's systemd cgroup.
+Importantly, an OOM kill now most likely terminates a single download child rather than the whole
+server — that job lands in `failed` (retryable, partial files kept) and the dashboard stays up.
 
 Binding to `0.0.0.0` (the default) exposes an **unauthenticated** dashboard that downloads using
 your HF token — only run on a trusted network, or set `HOST=127.0.0.1`.

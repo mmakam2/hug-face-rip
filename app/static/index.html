@@ -18,6 +18,7 @@ input:focus{outline:none;border-color:var(--accent)}
 button{background:var(--accent);color:#1b1b1b;border:0;border-radius:8px;padding:11px 18px;font-weight:600;cursor:pointer}
 button.ghost{background:transparent;color:var(--muted);border:1px solid var(--line);padding:6px 11px;font-weight:500}
 button.ghost:hover{color:var(--fg);border-color:var(--muted)}
+td button.ghost + button.ghost{margin-left:6px}
 table{width:100%;border-collapse:collapse}
 th{text-align:left;color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em;padding:0 10px 10px}
 td{padding:12px 10px;border-top:1px solid var(--line);vertical-align:middle}
@@ -30,7 +31,7 @@ td{padding:12px 10px;border-top:1px solid var(--line);vertical-align:middle}
 .bar{height:6px;background:var(--line);border-radius:99px;overflow:hidden;min-width:130px}
 .bar>span{display:block;height:100%;background:var(--accent);transition:width .4s ease}
 .st{font-size:13px;font-weight:600;text-transform:capitalize}
-.st.completed{color:var(--ok)}.st.failed{color:var(--err)}.st.running{color:var(--accent)}.st.queued,.st.cancelled{color:var(--muted)}
+.st.completed{color:var(--ok)}.st.failed{color:var(--err)}.st.running{color:var(--accent)}.st.queued,.st.cancelled{color:var(--muted)}.st.paused{color:#d2a24c}
 .err{color:var(--err);font-size:12px;margin-top:4px;max-width:420px}
 .size{color:var(--muted);font-size:13px;white-space:nowrap}
 .empty{color:var(--muted);text-align:center;padding:44px 0}
@@ -135,8 +136,20 @@ function confirmDelete(id, slug, bytes) {
   act(id, "delete");
 }
 window.confirmDelete = confirmDelete;
+function confirmCancel(id, slug, bytes) {
+  if (!confirm(`Stop and discard ${slug} (${fmt(bytes)} downloaded)? This frees disk space and cannot be undone.`)) return;
+  act(id, "cancel");
+}
+window.confirmCancel = confirmCancel;
 function row(j) {
-  const actions = j.status === "failed"
+  const actions =
+      j.status === "running"
+    ? `<button class="ghost" onclick="act(${j.id},'pause')">Pause</button>`
+      + `<button class="ghost" onclick="confirmCancel(${j.id},'${esc(j.slug)}',${j.downloaded_bytes})">Cancel</button>`
+    : j.status === "paused"
+    ? `<button class="ghost" onclick="act(${j.id},'resume')">Resume</button>`
+      + `<button class="ghost" onclick="confirmCancel(${j.id},'${esc(j.slug)}',${j.downloaded_bytes})">Cancel</button>`
+    : j.status === "failed"
     ? `<button class="ghost" onclick="act(${j.id},'retry')">Retry</button>`
     : j.status === "queued"
     ? `<button class="ghost" onclick="act(${j.id},'cancel')">Cancel</button>`

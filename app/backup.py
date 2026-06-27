@@ -11,6 +11,8 @@ from huggingface_hub.utils import (
     RepositoryNotFoundError,
 )
 
+from .db import PAUSED
+
 REPO_TYPES = ["model", "dataset", "space"]
 
 
@@ -59,14 +61,20 @@ def directory_size(path: Path) -> int:
         return 0
     total = 0
     for item in path.rglob("*"):
-        if not item.is_file():
+        try:
+            if not item.is_file():
+                continue
+            in_cache = ".cache" in item.relative_to(path).parts
+            # Count completed files, plus Xet's in-flight .incomplete staging which
+            # lives under .cache/huggingface/download/ — those bytes are on disk and
+            # would otherwise make progress look frozen until files finalize.
+            if not in_cache or item.suffix == ".incomplete":
+                total += item.stat().st_size
+        except OSError:
+            # A file can vanish between rglob() and stat() when the cancel path's
+            # rmtree runs concurrently with the poller thread.  Skip the gone item
+            # rather than crashing the daemon poller with a traceback.
             continue
-        in_cache = ".cache" in item.relative_to(path).parts
-        # Count completed files, plus Xet's in-flight .incomplete staging which
-        # lives under .cache/huggingface/download/ — those bytes are on disk and
-        # would otherwise make progress look frozen until files finalize.
-        if not in_cache or item.suffix == ".incomplete":
-            total += item.stat().st_size
     return total
 
 
@@ -85,10 +93,56 @@ def free_disk_bytes(path) -> int:
 POLL_INTERVAL = 1.5
 
 
-def run_backup_job(job_id, store, settings, api=None, downloader=None, stopping=None) -> None:
-    if downloader is None:
-        from huggingface_hub import snapshot_download
-        downloader = snapshot_download
+class RunningRegistry:
+    """Tracks the live download handle and stop intent for each running job.
+
+    Endpoints reach a running download only through here. The worker registers
+    its handle after start and unregisters in a finally; unregister clears the
+    intent too, so a paused-then-resumed job (same job_id) never inherits a stale
+    'pause' from its previous run.
+    """
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._handles = {}
+        self._intents = {}
+
+    def register(self, job_id, handle) -> None:
+        with self._lock:
+            self._handles[job_id] = handle
+
+    def unregister(self, job_id) -> None:
+        with self._lock:
+            self._handles.pop(job_id, None)
+            self._intents.pop(job_id, None)
+
+    def intent(self, job_id):
+        with self._lock:
+            return self._intents.get(job_id)
+
+    def request(self, job_id, intent) -> bool:
+        """Record a stop intent; terminate the live handle if one is registered.
+        Returns True if a handle was terminated (False if none was running yet —
+        the worker will honor the recorded intent once it registers)."""
+        with self._lock:
+            self._intents[job_id] = intent
+            handle = self._handles.get(job_id)
+        if handle is not None:
+            handle.terminate()
+            return True
+        return False
+
+    def terminate_all(self) -> None:
+        with self._lock:
+            handles = list(self._handles.values())
+        for handle in handles:
+            handle.terminate()
+
+
+def run_backup_job(job_id, store, settings, api=None, launcher=None,
+                   stopping=None, registry=None) -> None:
+    if launcher is None:
+        from .launcher import SubprocessLauncher
+        launcher = SubprocessLauncher()
 
     job = store.get_job(job_id)
     if job is None or job.status == "cancelled":
@@ -125,51 +179,85 @@ def run_backup_job(job_id, store, settings, api=None, downloader=None, stopping=
             )
 
         poller.start()
-        downloader(
+        handle = launcher.start(
             repo_id=job.slug,
             repo_type=job.repo_type,
             local_dir=str(local_dir),
             token=settings.hf_token or None,
             max_workers=settings.max_workers,
         )
+        if registry is not None:
+            registry.register(job_id, handle)
+            # Close the race where pause/cancel landed before registration.
+            if registry.intent(job_id) is not None:
+                handle.terminate()
+
+        outcome = handle.wait()
         stop.set()
         poller.join(timeout=2)
-        final = directory_size(local_dir)
-        store.update_progress(job_id, total if total else final, total_bytes=total)
-        store.set_status(job_id, "completed")
-    except Exception as exc:  # noqa: BLE001 - surface any failure on the job
+
+        intent = registry.intent(job_id) if registry is not None else None
+
+        if outcome is not None and outcome.ok:
+            # Finished before any stop signal landed -> completion wins.
+            final = directory_size(local_dir)
+            store.update_progress(job_id, total if total else final, total_bytes=total)
+            store.set_status(job_id, "completed")
+        elif intent == "pause":
+            store.set_status(job_id, PAUSED)
+        elif intent == "cancel":
+            delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
+            store.delete_job(job_id)
+        elif stopping is not None and stopping.is_set():
+            # Process-wide shutdown terminated the child; leave the job 'running'
+            # so the startup re-queue resumes it instead of failing it.
+            return
+        else:
+            err = outcome.error if outcome is not None else \
+                f"download process exited unexpectedly (code {handle.exitcode})"
+            store.set_status(job_id, "failed", error=str(err)[:500])
+    except Exception as exc:  # noqa: BLE001 - surface any pre-download failure
         stop.set()
         if poller.is_alive():
             poller.join(timeout=2)
-        # If the process is shutting down, snapshot_download's thread pool raises
-        # "cannot schedule new futures after interpreter shutdown". That is not a
-        # real download failure — leave the job in its current ('running') state so
-        # the startup re-queue resumes it instead of marking it permanently failed.
         if stopping is not None and stopping.is_set():
             return
         store.set_status(job_id, "failed", error=str(exc)[:500])
+    finally:
+        if registry is not None:
+            registry.unregister(job_id)
 
 
 class JobRunner:
-    def __init__(self, store, settings, api=None, downloader=None) -> None:
+    def __init__(self, store, settings, api=None, launcher=None) -> None:
         self._store = store
         self._settings = settings
         self._api = api
-        self._downloader = downloader
+        self._launcher = launcher
         self._stopping = threading.Event()
+        self._registry = RunningRegistry()
         self._executor = ThreadPoolExecutor(max_workers=settings.max_concurrent_jobs)
 
     def submit(self, job_id) -> None:
         self._executor.submit(
             run_backup_job, job_id, self._store, self._settings,
-            self._api, self._downloader, self._stopping,
+            self._api, self._launcher, self._stopping, self._registry,
         )
+
+    def pause(self, job_id) -> None:
+        """Stop a running download but keep its files (worker sets it 'paused')."""
+        self._registry.request(job_id, "pause")
+
+    def cancel(self, job_id) -> bool:
+        """Stop a running download; the worker deletes its files + row once the
+        child dies. Returns True if a live download was terminated."""
+        return self._registry.request(job_id, "cancel")
 
     def shutdown(self, wait: bool = False) -> None:
         """Stop the runner. Default (wait=False) is for process shutdown: signal
-        in-flight workers that we're stopping (so they leave their jobs resumable)
-        and cancel not-yet-started jobs (which stay 'queued' for the next startup
-        to resume) without blocking on the in-flight download. wait=True drains
-        every job to completion instead."""
+        in-flight workers that we're stopping (so they leave their jobs resumable),
+        terminate their child processes, and cancel not-yet-started jobs (which
+        stay 'queued' for the next startup). wait=True drains to completion."""
         self._stopping.set()
+        self._registry.terminate_all()
         self._executor.shutdown(wait=wait, cancel_futures=not wait)
