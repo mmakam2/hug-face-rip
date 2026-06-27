@@ -38,3 +38,10 @@ def test_repo_type_rendered_as_colored_badge(client):
     assert 'class="badge ' in page   # row template tags each job with a typed badge
     for repo_type in ("model", "dataset", "space"):
         assert f".badge.{repo_type}" in page  # per-type color rule exists
+
+
+def test_storage_bar_has_used_and_planned_segments(client):
+    page = client.get("/").text
+    assert "sused" in page            # current-usage segment
+    assert ".splanned" in page        # planned (queued + running-remaining) segment
+    assert ".splanned.over" in page   # overflow color rule when projected > capacity

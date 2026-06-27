@@ -128,6 +128,19 @@ class JobStore:
             ).fetchall()
         return [self._to_job(r) for r in rows]
 
+    def pending_bytes(self) -> int:
+        """Bytes still to be downloaded across running + queued jobs.
+
+        The per-row max(..., 0) guards against a row whose reported progress
+        exceeds its total (e.g. transient over-counting of in-flight staging).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(MAX(total_bytes - downloaded_bytes, 0)), 0) "
+                "FROM jobs WHERE status IN ('running', 'queued')"
+            ).fetchone()
+        return row[0] or 0
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

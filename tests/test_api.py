@@ -188,6 +188,19 @@ def test_storage_reports_backup_disk_usage(ctx):
     assert body["used"] <= body["total"]
 
 
+def test_storage_reports_planned_bytes(ctx):
+    client, store, runner = ctx
+    a = store.create_job("a/b", "model")
+    store.update_progress(a.id, 0, 100)            # queued, remaining 100
+    b = store.create_job("c/d", "model")
+    store.set_status(b.id, "running")
+    store.update_progress(b.id, 40, 100)           # running, remaining 60
+    done = store.create_job("e/f", "model")
+    store.set_status(done.id, "completed")
+    store.update_progress(done.id, 50, 50)         # completed, excluded
+    assert client.get("/api/storage").json()["planned"] == 160   # 100 + 60
+
+
 def test_startup_resumes_unfinished_jobs(tmp_path):
     settings = make_settings(tmp_path)
     settings.backup_dir.mkdir(parents=True, exist_ok=True)
