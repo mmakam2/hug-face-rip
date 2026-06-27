@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from app.config import Settings
-from app.db import JobStore, FAILED, QUEUED, CANCELLED
+from app.db import JobStore, FAILED, QUEUED
 from app.main import create_app
 
 
@@ -86,14 +86,33 @@ def test_retry_only_failed(ctx):
     assert job.id in runner.submitted
 
 
-def test_cancel_only_queued(ctx):
+def test_cancel_removes_queued_job_from_the_list(ctx):
     client, store, runner = ctx
     job = store.create_job("a/b", "model")
     resp = client.post(f"/api/jobs/{job.id}/cancel")
     assert resp.status_code == 200
-    assert resp.json()["status"] == CANCELLED
+    assert store.get_job(job.id) is None                  # deleted, not just flagged
+    assert client.get("/api/jobs").json()["jobs"] == []   # leaves the list
+
+
+def test_cancel_running_job_is_rejected(ctx):
+    client, store, runner = ctx
+    job = store.create_job("a/b", "model")
     store.set_status(job.id, "running")
     assert client.post(f"/api/jobs/{job.id}/cancel").status_code == 409
+
+
+def test_readd_after_cancel_does_not_resurrect_cancelled_instances(ctx):
+    client, store, runner = ctx
+    client.post("/api/jobs", json={"slug": "o/n"})        # model + dataset, queued
+    for j in store.list_jobs():
+        client.post(f"/api/jobs/{j.id}/cancel")            # cancel both
+    assert store.list_jobs() == []                         # all gone
+    runner.submitted.clear()
+    client.post("/api/jobs", json={"slug": "o/n"})        # re-add the same slug
+    jobs = store.list_jobs()
+    assert {j.repo_type for j in jobs} == {"model", "dataset"}  # fresh pair
+    assert all(j.status == QUEUED for j in jobs)           # not resurrected from cancelled
 
 
 def test_retry_missing_job_404(ctx):

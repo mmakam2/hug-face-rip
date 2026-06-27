@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .backup import JobRunner, detect_repo_types
 from .config import load_settings
-from .db import CANCELLED, FAILED, JobStore, QUEUED, RUNNING
+from .db import FAILED, JobStore, QUEUED, RUNNING
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -55,7 +55,7 @@ def create_app(settings, store, runner, detect=detect_repo_types) -> FastAPI:
                 # snapshot_download into the same directory.
                 job = existing
             else:
-                # completed / failed / cancelled -> resume or retry
+                # completed / failed -> resume or retry
                 store.requeue(existing.id)
                 runner.submit(existing.id)
                 job = store.get_job(existing.id)
@@ -94,8 +94,8 @@ def create_app(settings, store, runner, detect=detect_repo_types) -> FastAPI:
             raise HTTPException(status_code=404, detail="job not found")
         if job.status != QUEUED:
             raise HTTPException(status_code=409, detail="only queued jobs can be cancelled")
-        store.set_status(job_id, CANCELLED)
-        return store.get_job(job_id).to_dict()
+        store.delete_job(job_id)
+        return {"deleted": job_id}
 
     return app
 
