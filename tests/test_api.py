@@ -23,6 +23,9 @@ def make_settings(tmp_path):
     )
 
 
+FAKE_SIZE = 4242  # bytes the fake sizer reports for queued jobs
+
+
 @pytest.fixture
 def ctx(tmp_path):
     settings = make_settings(tmp_path)
@@ -30,7 +33,8 @@ def ctx(tmp_path):
     store = JobStore(settings.db_path)
     runner = FakeRunner()
     detect = lambda slug, token: ["model", "dataset"] if slug == "o/n" else []
-    app = create_app(settings, store, runner, detect=detect)
+    sizer = lambda slug, repo_type, token: FAKE_SIZE
+    app = create_app(settings, store, runner, detect=detect, sizer=sizer)
     client = TestClient(app)
     yield client, store, runner
     store.close()
@@ -44,6 +48,35 @@ def test_create_jobs_makes_one_per_detected_type(ctx):
     assert {j["repo_type"] for j in jobs} == {"model", "dataset"}
     assert all(j["status"] == QUEUED for j in jobs)
     assert len(runner.submitted) == 2
+
+
+def test_queued_job_is_populated_with_its_size(ctx):
+    client, store, runner = ctx
+    client.post("/api/jobs", json={"slug": "o/n"})   # detect -> model + dataset, both queued
+    jobs = store.list_jobs()
+    assert all(j.status == QUEUED for j in jobs)
+    assert all(j.total_bytes == FAKE_SIZE for j in jobs)   # size shown before it runs
+    assert all(j.downloaded_bytes == 0 for j in jobs)      # nothing downloaded yet
+
+
+def test_size_lookup_failure_still_queues_job_at_zero(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(settings.db_path)
+    runner = FakeRunner()
+
+    def boom(slug, repo_type, token):
+        raise RuntimeError("hub unreachable")
+
+    app = create_app(settings, store, runner, detect=lambda s, t: ["model"], sizer=boom)
+    client = TestClient(app)
+    resp = client.post("/api/jobs", json={"slug": "x/y"})
+    assert resp.status_code == 200
+    job = store.list_jobs()[0]
+    assert job.status == QUEUED
+    assert job.total_bytes == 0           # best-effort: failed sizing leaves 0
+    assert job.id in runner.submitted     # job still queued to run
+    store.close()
 
 
 def test_create_unknown_slug_404(ctx):
