@@ -1,0 +1,21 @@
+# Secrets & local config
+.env
+
+# Backup destination (whatever BACKUP_DIR points to, if inside the repo)
+/backups/
+
+# Job database
+*.db
+*.sqlite3
+*.sqlite3-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editor/OS
+.DS_Store
