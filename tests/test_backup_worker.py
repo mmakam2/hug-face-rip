@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 from pathlib import Path
@@ -561,7 +562,7 @@ def test_worker_requeue_intent_returns_job_to_queued_keeping_files(tmp_path):
     store.close()
 
 
-def test_worker_stall_watchdog_requeues_as_retry_keeping_files(tmp_path):
+def test_worker_stall_watchdog_requeues_as_retry_keeping_files(tmp_path, caplog):
     # A download child that is alive but writes no bytes for stall_timeout seconds
     # (a half-dead connection the downloader never timed out on) must be terminated
     # by the poller's watchdog and recorded as a transient failure -> RETRYING, so
@@ -575,15 +576,22 @@ def test_worker_stall_watchdog_requeues_as_retry_keeping_files(tmp_path):
         job_id=job.id, store=store, settings=settings, api=FakeApi(1000),
         launcher=InThreadLauncher(blocking_downloader_factory(started)),
         registry=registry))
-    t.start()
-    assert started.wait(3)            # partial file written, download now idle
-    t.join(8)                         # watchdog should fire and end the run
+    with caplog.at_level(logging.WARNING, logger="app.backup"):
+        t.start()
+        assert started.wait(3)        # partial file written, download now idle
+        t.join(8)                     # watchdog should fire and end the run
     j = store.get_job(job.id)
     assert j.status == RETRYING
     assert j.retry_count == 1
     assert j.next_retry_at is not None
     assert "stall" in (j.error or "")
     assert (tmp_path / "backups" / "models" / "o" / "n" / "partial.bin").exists()
+    # The watchdog must leave a trail in the logs (it only wrote to the DB before),
+    # so a wedged download is visible in `journalctl`, not just the dashboard.
+    stall_logs = [r for r in caplog.records
+                  if r.levelno >= logging.WARNING and "stall" in r.getMessage().lower()]
+    assert stall_logs, "watchdog stall should emit a WARNING log"
+    assert "o/n" in stall_logs[0].getMessage()   # identifies which job stalled
     store.close()
 
 

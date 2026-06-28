@@ -1,4 +1,5 @@
 import json
+import logging
 import shutil
 import threading
 import time
@@ -16,6 +17,8 @@ from huggingface_hub.utils import (
 from .db import PAUSED, VERIFYING, COMPLETED
 from .retry import is_retryable, BACKOFF_SECONDS, MAX_RETRIES
 from .verify import verify_repo, expected_file_hashes, VerifyAborted
+
+logger = logging.getLogger(__name__)
 
 REPO_TYPES = ["model", "dataset", "space"]
 
@@ -288,6 +291,12 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
             # Treat it like any transient failure: retry with backoff, keep partial files.
             if stopping is not None and stopping.is_set():
                 return    # shutting down -> leave running for the startup re-queue
+            # Log it: the stall outcome otherwise lives only in the DB error column,
+            # leaving no trail in journalctl to answer "is a download stalling?".
+            logger.warning(
+                "stall watchdog terminated %s (%s): no on-disk progress for %.0f min; "
+                "requeued as retry %d, partial files kept",
+                job.slug, job.repo_type, settings.stall_timeout / 60, job.retry_count + 1)
             _record_failure(
                 store, job_id, job.retry_count,
                 f"download stalled: no progress for {settings.stall_timeout / 60:.0f} min",
