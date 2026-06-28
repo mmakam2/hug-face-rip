@@ -69,3 +69,18 @@ def test_verify_downloads_disabled_by_env(tmp_path):
 def test_verify_downloads_enabled_by_env(tmp_path):
     s = load_settings(base_env(tmp_path) | {"VERIFY_DOWNLOADS": "1"})
     assert s.verify_downloads is True
+
+
+def test_stall_timeout_defaults_to_600(tmp_path):
+    s = load_settings(base_env(tmp_path))
+    assert s.stall_timeout == 600.0
+
+
+def test_stall_timeout_from_env(tmp_path):
+    s = load_settings(base_env(tmp_path) | {"STALL_TIMEOUT_SECONDS": "45"})
+    assert s.stall_timeout == 45.0
+
+
+def test_invalid_stall_timeout_raises(tmp_path):
+    with pytest.raises(ConfigError):
+        load_settings(base_env(tmp_path) | {"STALL_TIMEOUT_SECONDS": "notanumber"})

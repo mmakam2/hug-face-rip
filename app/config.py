@@ -16,6 +16,7 @@ class Settings:
     max_workers: int
     db_path: Path
     verify_downloads: bool = True
+    stall_timeout: float = 600.0
 
 
 def _int(env: Mapping[str, str], key: str, default: int) -> int:
@@ -26,6 +27,16 @@ def _int(env: Mapping[str, str], key: str, default: int) -> int:
         return int(raw)
     except ValueError:
         raise ConfigError(f"{key} must be an integer, got {raw!r}")
+
+
+def _float(env: Mapping[str, str], key: str, default: float) -> float:
+    raw = env.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ConfigError(f"{key} must be a number, got {raw!r}")
 
 
 def _bool(env: Mapping[str, str], key: str, default: bool) -> bool:
@@ -61,4 +72,5 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         max_workers=_int(env, "MAX_WORKERS", 8),
         db_path=Path(env.get("DB_PATH") or "jobs.db"),
         verify_downloads=_bool(env, "VERIFY_DOWNLOADS", True),
+        stall_timeout=_float(env, "STALL_TIMEOUT_SECONDS", 600.0),
     )

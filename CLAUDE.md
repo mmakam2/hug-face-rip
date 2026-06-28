@@ -29,7 +29,8 @@ Integration tests are **excluded by default** (`pytest.ini` sets `-m "not integr
 
 `.env` holds secrets (HF token) — **do not read it**; reference variables by name. Required:
 `HUGGINGFACE_ACCESS_KEY`, `BACKUP_DIR`. Optional: `MAX_CONCURRENT_JOBS` (default 2), `MAX_WORKERS`
-(default 8), `DB_PATH` (default `jobs.db`). See `.env.example`.
+(default 8), `DB_PATH` (default `jobs.db`), `STALL_TIMEOUT_SECONDS` (default 600; 0 disables the
+stall watchdog). See `.env.example`.
 
 ## Architecture
 
@@ -43,6 +44,8 @@ Request/data flow across the modules:
 - **`config.py`** — `load_settings()` reads env into a frozen `Settings` dataclass; validates the
   token, creates/writes-checks `BACKUP_DIR`, raises `ConfigError` on bad input. `verify_downloads`
   (env `VERIFY_DOWNLOADS`, default on) gates the automatic post-download integrity check.
+  `stall_timeout` (env `STALL_TIMEOUT_SECONDS`, default 600; 0 disables) is the no-disk-progress
+  window after which the poller's stall watchdog terminates a hung download.
 - **`db.py`** — `JobStore` wraps **one** SQLite connection shared across threads (a `threading.Lock`
   guards every call; `check_same_thread=False`). `Job` has a computed `percent`. Status lifecycle:
   `queued → running → verifying → completed | failed | paused | retrying`. A **transient** failure (DNS,
@@ -67,7 +70,7 @@ Request/data flow across the modules:
   **pre-flight disk-space check**, then run `snapshot_download(..., max_workers=max_workers)` in a
   **terminable child process** (`app/launcher.py`, `SubprocessLauncher`, spawn) so it can be
   paused/cancelled near-instantly even mid-file. A `RunningRegistry` maps `job_id → handle`+intent
-  (`pause`/`cancel`/`requeue`/`stop_verify`); the worker performs the single terminal transition
+  (`pause`/`cancel`/`requeue`/`stall`/`stop_verify`); the worker performs the single terminal transition
   after the child exits. After a successful download (when `verify_downloads`) the worker runs
   `_verify_phase`, which hashes every file via `app/verify.py` **cooperatively in-thread** (a stop
   `Event` checked between chunks, registered in `RunningRegistry` like a download — no subprocess)
@@ -93,7 +96,14 @@ Request/data flow across the modules:
    completing is decided by `snapshot_download` returning, *not* by the byte count. `directory_size`
    counts completed files **plus `*.incomplete` Xet staging** under `.cache/huggingface/download/`
    (other `.cache` content is excluded) — without that, progress freezes for minutes under Xet then
-   jumps, because Xet stages large files there before renaming them into place.
+   jumps, because Xet stages large files there before renaming them into place. The same poller also
+   runs the **stall watchdog**: it tracks the high-water mark of on-disk bytes and, if they don't
+   grow for `stall_timeout` (env `STALL_TIMEOUT_SECONDS`, default 600s), terminates the download via
+   a `"stall"` intent. The worker records that as a **transient failure** (→ `retrying` with backoff,
+   partial files kept), so a half-dead connection that hangs with no error — and wedges the whole
+   queue behind it under a low `MAX_CONCURRENT_JOBS` — recovers automatically instead of stalling
+   forever. Disabled when `stall_timeout` is 0 or no `RunningRegistry` is wired (the watchdog needs
+   the registry to reach the child handle).
 
 2. **`MAX_CONCURRENT_JOBS` × `MAX_WORKERS` multiply into memory pressure** (repos-in-parallel ×
    files-per-repo). Both are the dials for the speed/RAM tradeoff.
