@@ -1,6 +1,7 @@
 import json
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional
@@ -194,8 +195,24 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
     stop = threading.Event()
 
     def _poll():
+        # Stall watchdog: a download child can hang on a half-dead TCP connection
+        # (CDN dropped it, no read timeout fired) — the process is alive but writes
+        # nothing. Track the high-water mark of on-disk bytes; if it doesn't grow for
+        # stall_timeout seconds, terminate the child so the worker records a retryable
+        # failure and frees the slot, instead of the queue wedging behind a silent
+        # hang forever. Needs the registry to reach the handle; skipped if disabled.
+        high_water = directory_size(local_dir)
+        last_growth = time.monotonic()
         while not stop.is_set():
-            store.update_progress(job_id, directory_size(local_dir))
+            size = directory_size(local_dir)
+            store.update_progress(job_id, size)
+            if size > high_water:
+                high_water = size
+                last_growth = time.monotonic()
+            elif (registry is not None and settings.stall_timeout > 0
+                    and time.monotonic() - last_growth > settings.stall_timeout):
+                registry.request(job_id, "stall")
+                return
             stop.wait(POLL_INTERVAL)
 
     poller = threading.Thread(target=_poll, daemon=True)
@@ -266,6 +283,15 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
         elif intent == "requeue":
             # Global pause: stop and return to the queue (keep files), no retry change.
             store.set_status(job_id, "queued")
+        elif intent == "stall":
+            # Watchdog terminated a hung download (no disk progress for stall_timeout).
+            # Treat it like any transient failure: retry with backoff, keep partial files.
+            if stopping is not None and stopping.is_set():
+                return    # shutting down -> leave running for the startup re-queue
+            _record_failure(
+                store, job_id, job.retry_count,
+                f"download stalled: no progress for {settings.stall_timeout / 60:.0f} min",
+                retryable=True)
         elif stopping is not None and stopping.is_set():
             # Process-wide shutdown terminated the child; leave the job 'running'
             # so the startup reset re-queues it instead of failing it.

@@ -143,7 +143,7 @@ def _write_completed_repo(store, settings, slug, files):
     return job
 
 
-def make_settings(tmp_path, max_jobs=2, verify_downloads=False):
+def make_settings(tmp_path, max_jobs=2, verify_downloads=False, stall_timeout=600.0):
     return Settings(
         hf_token="hf_test",
         backup_dir=tmp_path / "backups",
@@ -151,6 +151,7 @@ def make_settings(tmp_path, max_jobs=2, verify_downloads=False):
         max_workers=4,
         db_path=tmp_path / "jobs.db",
         verify_downloads=verify_downloads,
+        stall_timeout=stall_timeout,
     )
 
 
@@ -557,6 +558,55 @@ def test_worker_requeue_intent_returns_job_to_queued_keeping_files(tmp_path):
     j = store.get_job(job.id)
     assert j.status == QUEUED
     assert (tmp_path / "backups" / "models" / "o" / "n" / "partial.bin").exists()
+    store.close()
+
+
+def test_worker_stall_watchdog_requeues_as_retry_keeping_files(tmp_path):
+    # A download child that is alive but writes no bytes for stall_timeout seconds
+    # (a half-dead connection the downloader never timed out on) must be terminated
+    # by the poller's watchdog and recorded as a transient failure -> RETRYING, so
+    # the slot frees and the dispatcher re-attempts. Partial files are kept.
+    settings = make_settings(tmp_path, stall_timeout=0.1)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+    registry = RunningRegistry()
+    started = threading.Event()
+    t = threading.Thread(target=run_backup_job, kwargs=dict(
+        job_id=job.id, store=store, settings=settings, api=FakeApi(1000),
+        launcher=InThreadLauncher(blocking_downloader_factory(started)),
+        registry=registry))
+    t.start()
+    assert started.wait(3)            # partial file written, download now idle
+    t.join(8)                         # watchdog should fire and end the run
+    j = store.get_job(job.id)
+    assert j.status == RETRYING
+    assert j.retry_count == 1
+    assert j.next_retry_at is not None
+    assert "stall" in (j.error or "")
+    assert (tmp_path / "backups" / "models" / "o" / "n" / "partial.bin").exists()
+    store.close()
+
+
+def test_worker_does_not_stall_a_progressing_download(tmp_path):
+    # A download that keeps writing bytes must never be killed by the watchdog,
+    # even with a tiny stall_timeout: every write resets the no-progress timer.
+    settings = make_settings(tmp_path, stall_timeout=0.2)
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model")
+
+    def growing(*, local_dir, stop=None, **_):
+        target = Path(local_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        # ~1.2s of steady growth, each tick well under stall_timeout apart.
+        for i in range(12):
+            (target / f"part{i}.bin").write_bytes(b"x" * 1000)
+            if stop is not None and stop.wait(0.1):
+                return
+
+    run_backup_job(job.id, store, settings, api=FakeApi(12000),
+                   launcher=InThreadLauncher(growing), registry=RunningRegistry())
+    j = store.get_job(job.id)
+    assert j.status == COMPLETED      # progressed to the end, never stalled
     store.close()
 
 
