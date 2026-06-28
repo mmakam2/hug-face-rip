@@ -26,6 +26,14 @@ Environment=MAX_WORKERS=2
 # gets (default 16) to keep peak memory bounded: MAX_WORKERS (2) files in flight
 # × 8 range-gets each. Raise this for more speed if memory headroom allows.
 Environment=HF_XET_NUM_CONCURRENT_RANGE_GETS=8
+# Stall watchdog: terminate a download that writes no bytes to disk for this long
+# (a half-dead connection the downloader never timed out on) so the slot frees and
+# the job auto-retries. Lowered from the 600s default to 180s: with
+# MAX_CONCURRENT_JOBS=1 a single wedged download blocks the whole queue for the full
+# window, and healthy downloads here run hundreds of MB/s, so 3 min of zero on-disk
+# growth is a safe "it's dead" signal. (directory_size counts Xet .incomplete
+# staging, so a genuinely active download always shows growth and is never killed.)
+Environment=STALL_TIMEOUT_SECONDS=180
 ExecStart=/root/hug-face-rip/.venv/bin/python -m app.main
 # Memory backstop: cap the service at 8G so a runaway download is contained to
 # this unit instead of OOM-killing the whole box (10G RAM). No MemoryHigh — the
