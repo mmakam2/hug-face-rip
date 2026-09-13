@@ -4,13 +4,14 @@ import re
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from .backup import JobRunner, detect_repo_types, repo_total_bytes
-from .config import load_settings
+from .config import load_settings, target_online
 from .db import (
     COMPLETED, DELETING, FAILED, JobStore, PAUSED, QUEUED, RETRYING, RUNNING, VERIFYING,
 )
@@ -27,6 +28,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 class SlugIn(BaseModel):
     slug: str
+    target: Optional[str] = None      # storage target name; default = settings.default_target
 
 
 def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_total_bytes) -> FastAPI:
@@ -72,6 +74,12 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
             raise HTTPException(status_code=400, detail="slug is required")
         if not SLUG_RE.match(slug):
             raise HTTPException(status_code=400, detail="invalid slug; expected 'owner/name'")
+        target = (body.target or settings.default_target).strip()
+        if target not in settings.targets:
+            raise HTTPException(status_code=400, detail=f"unknown target {target!r}")
+        if not target_online(settings, target):
+            raise HTTPException(status_code=409,
+                                detail=f"target '{target}' is offline (not mounted?)")
         types = detect(slug, settings.hf_token)
         if not types:
             raise HTTPException(status_code=404, detail="repo not found or not accessible")
@@ -79,7 +87,7 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         for repo_type in types:
             existing = store.get_job_by_repo(repo_type, slug)
             if existing is None:
-                job = store.create_job(slug, repo_type)
+                job = store.create_job(slug, repo_type, target)
                 # Populate the size up front so the queued row shows its total
                 # instead of 0. Best-effort: if the Hub lookup fails, queue the
                 # job anyway and let run_backup_job compute the size when it runs.
@@ -108,14 +116,32 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
 
     @app.get("/api/storage")
     def storage():
-        usage = shutil.disk_usage(settings.backup_dir)
+        targets = []
+        for name in settings.targets:
+            path = settings.target_dir(name)
+            online = target_online(settings, name)
+            total = used = free = 0
+            if online:
+                try:
+                    usage = shutil.disk_usage(path)
+                    total, used, free = usage.total, usage.used, usage.free
+                except OSError:          # e.g. a soft-mounted share that just went away
+                    online = False
+            targets.append({
+                "name": name, "path": str(path),
+                "default": name == settings.default_target, "online": online,
+                "total": total, "used": used, "free": free,
+                "planned": store.pending_bytes(target=name),
+            })
+        head = targets[0]        # the top-level fields describe the default target
         return {
-            "path": str(settings.backup_dir),
-            "total": usage.total,
-            "used": usage.used,
-            "free": usage.free,
+            "path": head["path"],
+            "total": head["total"],
+            "used": head["used"],
+            "free": head["free"],
             "planned": store.pending_bytes(),
             "paused_all": store.get_flag("paused_all", "0") == "1",
+            "targets": targets,
         }
 
     @app.post("/api/jobs/{job_id}/retry")
@@ -229,7 +255,7 @@ def build_default_app() -> FastAPI:
 
     load_dotenv()
     settings = load_settings()
-    store = JobStore(settings.db_path)
+    store = JobStore(settings.db_path, default_target=settings.default_target)
     runner = JobRunner(store, settings)
     return create_app(settings, store, runner)
 
