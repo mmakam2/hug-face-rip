@@ -74,6 +74,43 @@ space, after a confirmation). Deleting and cancelling run in the background: the
 row shows *deleting…* with its bar draining while the files are removed, then
 disappears — removing a few hundred GB can take a couple of minutes.
 
+### Storage targets (local disk + NFS)
+
+By default everything goes to `BACKUP_DIR`. To offer several destinations, set
+`BACKUP_TARGETS` to a comma-separated list of `name=path`, first one default:
+
+```
+BACKUP_TARGETS=local=/mnt/zfshug,truenas=/mnt/truenas
+```
+
+A target picker then appears next to the slug box, the storage panel shows one
+bar per target, and each row is tagged with where it lives. A repo lives on
+exactly one target (re-adding it requeues the existing copy).
+
+Every target other than the first must contain a marker file, `.hug-face-rip`,
+at its root before the app will use it. That is the "is this share really
+mounted?" check: an unmounted NFS share is just an empty local directory, and
+without the marker the app would happily fill the root disk through it. While a
+target is offline (marker missing, NAS down) its bar reads *offline*, new jobs
+for it are refused, and queued jobs for it are held. A share dropping
+mid-download is treated as a transient failure and retried.
+
+For the TrueNAS export, `deploy/mnt-truenas.mount` + `.automount` mount
+`truenas.babendums.com:/mnt/RAIDZ1_1TB/hug-face-rip` at `/mnt/truenas`
+(NFSv4, `soft` so an outage returns errors instead of hanging the app). Install:
+
+```bash
+apt-get install -y nfs-common
+cp deploy/mnt-truenas.mount deploy/mnt-truenas.automount /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now mnt-truenas.automount
+ls /mnt/truenas                     # first access triggers the mount
+touch /mnt/truenas/.hug-face-rip    # mark the share as a backup target
+```
+
+The TrueNAS export must authorize this host and map root (the service runs as
+root). Adjust `What=`/`Where=` in the unit for a different server or path; the
+unit file name must match the mount point (`/mnt/truenas` → `mnt-truenas.*`).
+
 > **Security note:** binding to `0.0.0.0` exposes the dashboard to your whole
 > network. It has no authentication and triggers downloads using your Hugging
 > Face token, so only run it on a trusted network (or behind a firewall). To

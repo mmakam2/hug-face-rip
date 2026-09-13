@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slug TEXT NOT NULL,
     repo_type TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT 'local',
     status TEXT NOT NULL DEFAULT 'queued',
     total_bytes INTEGER NOT NULL DEFAULT 0,
     downloaded_bytes INTEGER NOT NULL DEFAULT 0,
@@ -52,6 +53,7 @@ class Job:
     next_retry_at: Optional[str] = None
     verify_status: str = "unverified"
     verify_detail: Optional[str] = None
+    target: str = "local"          # which configured storage target holds the files
 
     @property
     def percent(self) -> float:
@@ -66,8 +68,9 @@ class Job:
 
 
 class JobStore:
-    def __init__(self, db_path) -> None:
+    def __init__(self, db_path, default_target: str = "local") -> None:
         self._lock = threading.Lock()
+        self._default_target = default_target
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
@@ -82,16 +85,23 @@ class JobStore:
                 "ALTER TABLE jobs ADD COLUMN verify_status TEXT NOT NULL DEFAULT 'unverified'")
         if "verify_detail" not in cols:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN verify_detail TEXT")
+        if "target" not in cols:
+            # Rows from before storage targets existed all live on the (then only)
+            # backup dir, which is now the configured default target.
+            quoted = default_target.replace("'", "''")
+            self._conn.execute(
+                f"ALTER TABLE jobs ADD COLUMN target TEXT NOT NULL DEFAULT '{quoted}'")
         self._conn.execute("INSERT OR IGNORE INTO app_state (key, value) VALUES ('paused_all', '0')")
         self._conn.commit()
 
     def _to_job(self, row: sqlite3.Row) -> Job:
         return Job(**{key: row[key] for key in row.keys()})
 
-    def create_job(self, slug: str, repo_type: str) -> Job:
+    def create_job(self, slug: str, repo_type: str, target: Optional[str] = None) -> Job:
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO jobs (slug, repo_type) VALUES (?, ?)", (slug, repo_type)
+                "INSERT INTO jobs (slug, repo_type, target) VALUES (?, ?, ?)",
+                (slug, repo_type, target or self._default_target),
             )
             self._conn.commit()
             job_id = cur.lastrowid
@@ -178,16 +188,24 @@ class JobStore:
             ).fetchone()
         return row[0]
 
-    def next_runnable_job(self) -> Optional[Job]:
+    def next_runnable_job(self, targets: Optional[List[str]] = None) -> Optional[Job]:
         """Lowest-id job eligible to start now: a queued job (no pending retry
-        delay, or its delay has elapsed), or a retrying job whose backoff is up."""
+        delay, or its delay has elapsed), or a retrying job whose backoff is up.
+        `targets` (the currently online storage targets) restricts the pick; an
+        empty list means nothing can run."""
+        sql = (
+            "SELECT * FROM jobs WHERE "
+            "((status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))) "
+            "OR (status = 'retrying' AND next_retry_at <= datetime('now')))"
+        )
+        params: tuple = ()
+        if targets is not None:
+            if not targets:
+                return None
+            sql += " AND target IN (" + ",".join("?" * len(targets)) + ")"
+            params = tuple(targets)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM jobs WHERE "
-                "(status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))) "
-                "OR (status = 'retrying' AND next_retry_at <= datetime('now')) "
-                "ORDER BY id ASC LIMIT 1"
-            ).fetchone()
+            row = self._conn.execute(sql + " ORDER BY id ASC LIMIT 1", params).fetchone()
         return self._to_job(row) if row else None
 
     def claim(self, job_id: int) -> bool:
@@ -264,17 +282,21 @@ class JobStore:
             ).fetchall()
         return [self._to_job(r) for r in rows]
 
-    def pending_bytes(self) -> int:
-        """Bytes still to be downloaded across running + queued jobs.
+    def pending_bytes(self, target: Optional[str] = None) -> int:
+        """Bytes still to be downloaded across running + queued jobs, optionally
+        for one storage target.
 
         The per-row max(..., 0) guards against a row whose reported progress
         exceeds its total (e.g. transient over-counting of in-flight staging).
         """
+        sql = ("SELECT COALESCE(SUM(MAX(total_bytes - downloaded_bytes, 0)), 0) "
+               "FROM jobs WHERE status IN ('running', 'queued', 'retrying')")
+        params: tuple = ()
+        if target is not None:
+            sql += " AND target = ?"
+            params = (target,)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT COALESCE(SUM(MAX(total_bytes - downloaded_bytes, 0)), 0) "
-                "FROM jobs WHERE status IN ('running', 'queued', 'retrying')"
-            ).fetchone()
+            row = self._conn.execute(sql, params).fetchone()
         return row[0] or 0
 
     def close(self) -> None:

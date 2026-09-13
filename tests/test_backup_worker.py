@@ -964,3 +964,66 @@ def test_runner_shutdown_does_not_wait_for_an_inflight_delete(tmp_path):
     release.set()
     t.join(5)                                      # let it finish before the store closes
     store.close()
+
+
+# --- storage targets ---
+
+def _two_target_settings(tmp_path, **kw):
+    s = make_settings(tmp_path, **kw)
+    from dataclasses import replace
+    return replace(s, targets={"local": s.backup_dir, "nas": tmp_path / "nas"})
+
+
+def test_worker_writes_into_the_jobs_target_dir(tmp_path):
+    from app.config import MARKER
+    settings = _two_target_settings(tmp_path)
+    (tmp_path / "nas").mkdir(); (tmp_path / "nas" / MARKER).write_text("")
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model", target="nas")
+    run_backup_job(job.id, store, settings, api=FakeApi(11),
+                   launcher=InThreadLauncher(fake_downloader_factory()))
+    assert store.get_job(job.id).status == COMPLETED
+    assert (tmp_path / "nas" / "models" / "o" / "n" / "model.bin").exists()
+    assert not (settings.backup_dir / "models" / "o" / "n").exists()
+    store.close()
+
+
+def test_worker_offline_target_is_a_transient_failure(tmp_path):
+    settings = _two_target_settings(tmp_path)        # no marker -> nas offline
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model", target="nas")
+    run_backup_job(job.id, store, settings, api=FakeApi(11),
+                   launcher=InThreadLauncher(fake_downloader_factory()))
+    j = store.get_job(job.id)
+    assert j.status == RETRYING and "offline" in j.error
+    assert not (tmp_path / "nas").exists()            # nothing was written locally
+    store.close()
+
+
+def test_dispatcher_skips_jobs_whose_target_is_offline(tmp_path):
+    settings = _two_target_settings(tmp_path, max_jobs=2)
+    store = JobStore(settings.db_path)
+    nas = store.create_job("o/nas", "model", target="nas")     # lower id, offline
+    loc = store.create_job("o/loc", "model", target="local")
+    runner = JobRunner(store, settings, api=FakeApi(11),
+                       launcher=InThreadLauncher(fake_downloader_factory()),
+                       dispatch_interval=0.02)
+    runner.start()
+    assert wait_until(lambda: store.get_job(loc.id).status == COMPLETED)
+    assert store.get_job(nas.id).status == QUEUED               # held, never claimed
+    runner.shutdown()
+    store.close()
+
+
+def test_deleter_removes_from_the_jobs_target_dir(tmp_path):
+    from app.backup import run_delete_job
+    from app.config import MARKER
+    settings = _two_target_settings(tmp_path)
+    nas = tmp_path / "nas"; (nas / "models" / "o" / "n").mkdir(parents=True)
+    (nas / MARKER).write_text(""); (nas / "models" / "o" / "n" / "f.bin").write_bytes(b"x")
+    store = JobStore(settings.db_path)
+    job = store.create_job("o/n", "model", target="nas")
+    store.set_status(job.id, COMPLETED)
+    run_delete_job(job.id, store, settings)
+    assert not (nas / "models" / "o" / "n").exists() and store.get_job(job.id) is None
+    store.close()

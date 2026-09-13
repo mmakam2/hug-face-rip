@@ -17,7 +17,9 @@ _RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 # OSError errno values that indicate a transient network condition. (DNS
 # EAI_AGAIN is handled separately via socket.gaierror below.)
 _RETRYABLE_OS_ERRNO = {errno.ECONNRESET, errno.ECONNREFUSED, errno.ECONNABORTED,
-                       errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH}
+                       errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH,
+                       # A network share (soft NFS mount) going away mid-transfer.
+                       errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.EHOSTDOWN}
 
 
 def is_retryable(exc: BaseException) -> bool:

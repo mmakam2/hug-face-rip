@@ -571,3 +571,70 @@ def test_mutating_requests_are_logged_on_arrival(ctx, caplog):
     msgs = [r.getMessage() for r in caplog.records if r.name == "app.main"]
     assert any(m.startswith("POST") and f"/api/jobs/{job.id}/pause" in m for m in msgs), msgs
     assert not any("GET" in m for m in msgs), msgs
+
+
+# --- storage targets ---
+
+@pytest.fixture
+def ctx2(tmp_path):
+    """Two targets: 'local' (default) and 'nas' (online only with the marker)."""
+    from dataclasses import replace
+    from app.config import MARKER
+    settings = replace(make_settings(tmp_path),
+                       targets={"local": tmp_path / "backups", "nas": tmp_path / "nas"})
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(settings.db_path, default_target="local")
+    runner = FakeRunner(store)
+    app = create_app(settings, store, runner,
+                     detect=lambda slug, token: ["model"], sizer=lambda s, r, t: 10)
+    client = TestClient(app)
+
+    def bring_nas_online():
+        (tmp_path / "nas").mkdir(exist_ok=True)
+        (tmp_path / "nas" / MARKER).write_text("")
+
+    yield client, store, bring_nas_online
+    store.close()
+
+
+def test_create_job_on_a_named_target(ctx2):
+    client, store, online = ctx2
+    online()
+    resp = client.post("/api/jobs", json={"slug": "o/n", "target": "nas"})
+    assert resp.status_code == 200
+    assert resp.json()["jobs"][0]["target"] == "nas"
+    assert store.list_jobs()[0].target == "nas"
+
+
+def test_create_job_defaults_to_the_default_target(ctx2):
+    client, store, _ = ctx2
+    assert client.post("/api/jobs", json={"slug": "o/n"}).json()["jobs"][0]["target"] == "local"
+
+
+def test_create_job_unknown_target_400(ctx2):
+    client, store, _ = ctx2
+    resp = client.post("/api/jobs", json={"slug": "o/n", "target": "usb"})
+    assert resp.status_code == 400 and "target" in resp.json()["detail"]
+    assert store.list_jobs() == []
+
+
+def test_create_job_offline_target_409(ctx2):
+    client, store, _ = ctx2                      # no marker -> nas offline
+    resp = client.post("/api/jobs", json={"slug": "o/n", "target": "nas"})
+    assert resp.status_code == 409 and "offline" in resp.json()["detail"]
+    assert store.list_jobs() == []
+
+
+def test_storage_lists_every_target_with_online_flag(ctx2):
+    client, store, online = ctx2
+    j = store.create_job("o/n", "model", target="nas"); store.update_progress(j.id, 0, 40)
+    s = client.get("/api/storage").json()
+    by = {t["name"]: t for t in s["targets"]}
+    assert by["local"]["default"] is True and by["local"]["online"] is True
+    assert by["nas"]["online"] is False and by["nas"]["total"] == 0
+    assert by["nas"]["planned"] == 40 and by["local"]["planned"] == 0
+    assert s["planned"] == 40                    # top-level: all targets, as before
+    online()
+    s = client.get("/api/storage").json()
+    nas = next(t for t in s["targets"] if t["name"] == "nas")
+    assert nas["online"] is True and nas["total"] > 0
