@@ -287,3 +287,47 @@ def test_deleting_job_is_not_runnable(store):
     store.set_status(a.id, DELETING)
     assert store.next_runnable_job() is None
     assert store.unfinished_jobs() == []
+
+
+# --- storage targets ---
+
+def test_jobs_carry_a_target_defaulting_to_store_default(tmp_path):
+    s = JobStore(tmp_path / "j.db", default_target="nas")
+    a = s.create_job("o/a", "model")
+    b = s.create_job("o/b", "model", target="local")
+    assert a.target == "nas" and b.target == "local"
+    assert s.get_job(a.id).to_dict()["target"] == "nas"
+    s.close()
+
+
+def test_migration_adds_target_to_old_table_with_configured_default(tmp_path):
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL,
+          repo_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+          total_bytes INTEGER NOT NULL DEFAULT 0, downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+          error TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(repo_type, slug));
+        INSERT INTO jobs (slug, repo_type, status) VALUES ('old/row', 'model', 'completed');
+    """)
+    conn.commit(); conn.close()
+    s = JobStore(db, default_target="zfs")
+    assert s.get_job_by_repo("model", "old/row").target == "zfs"
+    s.close()
+
+
+def test_next_runnable_job_can_be_restricted_to_online_targets(store):
+    nas = store.create_job("o/nas", "model", target="nas")
+    loc = store.create_job("o/loc", "model", target="local")
+    assert store.next_runnable_job().id == nas.id                 # unrestricted: lowest id
+    assert store.next_runnable_job(targets=["local"]).id == loc.id
+    assert store.next_runnable_job(targets=[]) is None            # nothing online
+
+
+def test_pending_bytes_per_target(store):
+    a = store.create_job("o/a", "model", target="local"); store.update_progress(a.id, 10, 100)
+    b = store.create_job("o/b", "model", target="nas");   store.update_progress(b.id, 0, 50)
+    assert store.pending_bytes() == 140
+    assert store.pending_bytes(target="nas") == 50
+    assert store.pending_bytes(target="local") == 90
