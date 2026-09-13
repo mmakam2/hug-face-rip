@@ -70,7 +70,9 @@ queued will fit). While downloads are running it also shows the **aggregate
 download speed** across all active jobs. You can **retry** a failed backup,
 **cancel** a queued one, or
 **delete** a completed one (which removes its downloaded files and frees the
-space, after a confirmation).
+space, after a confirmation). Deleting and cancelling run in the background: the
+row shows *deleting…* with its bar draining while the files are removed, then
+disappears — removing a few hundred GB can take a couple of minutes.
 
 > **Security note:** binding to `0.0.0.0` exposes the dashboard to your whole
 > network. It has no authentication and triggers downloads using your Hugging

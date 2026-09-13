@@ -78,9 +78,11 @@ treated like any in-progress job (returned unchanged, not requeued).
 `app/db.py`: `DELETING` constant; `deleting_jobs()`.
 
 `app/main.py`: `delete`, `cancel` (non-running), `redownload` call
-`runner.delete(...)` and return `{"deleting": id}` (redownload returns the job
-dict as before, now with status `deleting`). Lifespan re-submits every
-`deleting_jobs()` on startup.
+`runner.delete(...)` and all return `{"deleting": id}`. Lifespan re-submits
+every `deleting_jobs()` on startup as a plain delete — the requeue intent is not
+persisted, so a re-download interrupted by a restart mid-rmtree ends as a
+delete (re-add the repo to download it again). Rare enough not to warrant a
+column.
 
 ## Logging
 
