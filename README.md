@@ -101,11 +101,23 @@ For the TrueNAS export, `deploy/mnt-truenas.mount` + `.automount` mount
 
 ```bash
 apt-get install -y nfs-common
-cp deploy/mnt-truenas.mount deploy/mnt-truenas.automount /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now mnt-truenas.automount
-ls /mnt/truenas                     # first access triggers the mount
+cp deploy/mnt-truenas.mount /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now mnt-truenas.mount
+findmnt /mnt/truenas                # must show the NFS source — only then:
 touch /mnt/truenas/.hug-face-rip    # mark the share as a backup target
 ```
+
+Only create the marker after `findmnt` confirms the share is mounted; created
+on the empty mountpoint it would make the app write to the root disk.
+
+**Inside a Proxmox LXC container** the mount fails with *Operation not
+permitted* until the container is allowed to mount NFS. On the Proxmox host:
+`pct set <CTID> --features mount=nfs` (add `nesting=1` etc. if already set),
+then restart the container. systemd `.automount` units are not supported in
+LXC, so the plain mount unit is used; a soft mount survives a NAS outage
+(I/O errors while it is down, recovers by itself), but if the NAS is down when
+the container boots, run `systemctl start mnt-truenas.mount` once it is back.
+`deploy/mnt-truenas.automount` is provided for hosts that do support automount.
 
 The TrueNAS export must authorize this host and map root (the service runs as
 root). Adjust `What=`/`Where=` in the unit for a different server or path; the

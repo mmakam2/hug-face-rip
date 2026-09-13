@@ -185,13 +185,18 @@ server — that job lands in `failed` (retryable, partial files kept) and the da
 
 **TrueNAS NFS target:** `deploy/mnt-truenas.mount` + `deploy/mnt-truenas.automount` mount
 `truenas.babendums.com:/mnt/RAIDZ1_1TB/hug-face-rip` at `/mnt/truenas` (NFSv4, `soft,timeo=50,
-retrans=2,retry=0` so an outage returns errors instead of hanging the poller/storage endpoint; the
-automount re-mounts on next access). The service unit sets `BACKUP_TARGETS=local=/mnt/zfshug,
-truenas=/mnt/truenas` and deliberately has no `RequiresMountsFor`. Install: `apt-get install -y
-nfs-common`, copy both units, `systemctl enable --now mnt-truenas.automount`, `ls /mnt/truenas`,
-`touch /mnt/truenas/.hug-face-rip`. While the NAS is unreachable, calls that touch it can take up
-to ~10 s each, so the storage panel and the dispatcher tick slow down; local downloads continue.
-The container is unconfined LXC with full caps, so it mounts NFS itself.
+retrans=2,retry=0` so an outage returns errors instead of hanging the poller/storage endpoint).
+**Use the plain `.mount` unit: systemd automount is not supported in this LXC container**, and
+the mount itself needs the Proxmox host to allow it (`pct set 150 --features mount=nfs`, then
+restart the CT) — otherwise `mount.nfs4: Operation not permitted`. The service unit sets
+`BACKUP_TARGETS=local=/mnt/zfshug,truenas=/mnt/truenas` and deliberately has no
+`RequiresMountsFor`. Install: `apt-get install -y nfs-common`, copy the unit, `systemctl enable
+--now mnt-truenas.mount`, **confirm with `findmnt /mnt/truenas`**, and only then
+`touch /mnt/truenas/.hug-face-rip` — a marker created on the empty mountpoint defeats the guard
+(it happened once; it was removed). A soft mount survives an outage (errors while down, recovers
+by itself); if the NAS is down at CT boot, `systemctl start mnt-truenas.mount` later. While the NAS
+is unreachable, calls that touch it can take up to ~10 s each, so the storage panel and the
+dispatcher tick slow down; local downloads continue.
 
 Binding to `0.0.0.0` (the default) exposes an **unauthenticated** dashboard that downloads using
 your HF token — only run on a trusted network, or set `HOST=127.0.0.1`.
