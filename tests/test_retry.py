@@ -50,3 +50,10 @@ def test_repo_not_found_is_permanent():
 ])
 def test_other_errors_are_permanent(exc):
     assert is_retryable(exc) is False
+
+
+@pytest.mark.parametrize("code", [errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.EHOSTDOWN])
+def test_nfs_style_io_errors_are_retryable(code):
+    # A soft-mounted share dropping mid-download surfaces as EIO/ESTALE/ENOTCONN;
+    # the job should back off and resume, not fail permanently.
+    assert is_retryable(OSError(code, "share went away")) is True
