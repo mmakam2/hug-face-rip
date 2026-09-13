@@ -137,9 +137,7 @@ def test_target_online_requires_marker_for_non_default(tmp_path):
     s = Settings(hf_token="t", backup_dir=tmp_path / "a", max_concurrent_jobs=1,
                  max_workers=1, db_path=tmp_path / "j.db",
                  targets={"local": tmp_path / "a", "nas": tmp_path / "nas"})
-    assert target_online(s, "local") is False        # default: needs the directory
-    (tmp_path / "a").mkdir()
-    assert target_online(s, "local") is True
+    assert target_online(s, "local") is True         # default: created at startup, always usable
     (tmp_path / "nas").mkdir()                       # an empty mountpoint dir...
     assert target_online(s, "nas") is False          # ...is offline without the marker
     (tmp_path / "nas" / MARKER).write_text("")

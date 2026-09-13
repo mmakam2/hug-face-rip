@@ -14,6 +14,7 @@ from huggingface_hub.utils import (
     RepositoryNotFoundError,
 )
 
+from .config import target_online
 from .db import PAUSED, VERIFYING, COMPLETED, DELETING, FAILED
 from .retry import is_retryable, BACKOFF_SECONDS, MAX_RETRIES
 from .verify import verify_repo, expected_file_hashes, VerifyAborted
@@ -21,6 +22,10 @@ from .verify import verify_repo, expected_file_hashes, VerifyAborted
 logger = logging.getLogger(__name__)
 
 REPO_TYPES = ["model", "dataset", "space"]
+
+
+class TargetOffline(RuntimeError):
+    """The job's storage target is not mounted/marked right now (transient)."""
 
 
 def detect_repo_types(slug: str, token: str, api: Optional[HfApi] = None) -> List[str]:
@@ -124,7 +129,8 @@ def run_delete_job(job_id, store, settings, requeue: bool = False,
     if job is None:
         return
     store.set_status(job_id, DELETING)
-    local_dir = local_dir_for(settings.backup_dir, job.repo_type, job.slug)
+    root = settings.target_dir(job.target)
+    local_dir = local_dir_for(root, job.repo_type, job.slug)
     before = directory_size(local_dir)
     logger.info("deleting %s (%s) job %d: %.1f GB at %s",
                 job.slug, job.repo_type, job_id, before / 1e9, local_dir)
@@ -140,7 +146,7 @@ def run_delete_job(job_id, store, settings, requeue: bool = False,
     poller.start()
     started = time.monotonic()
     try:
-        remover(settings.backup_dir, job.repo_type, job.slug)
+        remover(root, job.repo_type, job.slug)
     except Exception as exc:  # noqa: BLE001 - record and surface any failure
         stop.set()
         poller.join(timeout=2)
@@ -270,7 +276,8 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
         return
 
     store.set_status(job_id, "running")
-    local_dir = local_dir_for(settings.backup_dir, job.repo_type, job.slug)
+    root = settings.target_dir(job.target)
+    local_dir = local_dir_for(root, job.repo_type, job.slug)
 
     stop = threading.Event()
 
@@ -297,7 +304,11 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
 
     poller = threading.Thread(target=_poll, daemon=True)
     try:
-        backup_root = settings.backup_dir.resolve()
+        # The dispatcher only claims jobs on online targets, but the share can
+        # vanish between claim and start; never write into an unmounted path.
+        if not target_online(settings, job.target):
+            raise TargetOffline(f"target '{job.target}' is offline (not mounted?) — will retry")
+        backup_root = root.resolve()
         if not local_dir.resolve().is_relative_to(backup_root):
             raise ValueError(f"refusing to write outside backup dir: {local_dir}")
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -307,12 +318,12 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
 
         # Pre-flight: refuse a download that cannot physically fit, instead of
         # filling the disk / exhausting memory and getting OOM-killed mid-run.
-        free = free_disk_bytes(settings.backup_dir)
+        free = free_disk_bytes(root)
         remaining = total - already
         if total and remaining > free:
             raise RuntimeError(
                 f"not enough disk space for {job.slug}: needs ~{remaining / 1e9:.1f} GB "
-                f"more, only {free / 1e9:.1f} GB free in {settings.backup_dir}"
+                f"more, only {free / 1e9:.1f} GB free in {root}"
             )
 
         poller.start()
@@ -396,7 +407,8 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
             poller.join(timeout=2)
         if stopping is not None and stopping.is_set():
             return
-        _record_failure(store, job_id, job.retry_count, str(exc), is_retryable(exc))
+        retryable = True if isinstance(exc, TargetOffline) else is_retryable(exc)
+        _record_failure(store, job_id, job.retry_count, str(exc), retryable)
     finally:
         if registry is not None:
             registry.unregister(job_id)
@@ -410,7 +422,7 @@ def _verify_phase(job_id, store, settings, api=None, registry=None, stopping=Non
     if job is None:
         return
     store.set_status(job_id, VERIFYING)
-    local_dir = local_dir_for(settings.backup_dir, job.repo_type, job.slug)
+    local_dir = local_dir_for(settings.target_dir(job.target), job.repo_type, job.slug)
     total = job.total_bytes
 
     # The caller (download path) clears the download handle/intent before calling
@@ -499,8 +511,11 @@ class JobRunner:
         while not self._stopping.is_set():
             try:
                 if self._store.get_flag("paused_all", "0") != "1":   # valve open
+                    # Jobs on an offline target (share not mounted) stay queued.
+                    online = [name for name in self._settings.targets
+                              if target_online(self._settings, name)]
                     while self._store.running_count() < self._settings.max_concurrent_jobs:
-                        job = self._store.next_runnable_job()
+                        job = self._store.next_runnable_job(targets=online)
                         if job is None:
                             break
                         if self._store.claim(job.id):

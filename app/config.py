@@ -43,14 +43,15 @@ class Settings:
 
 
 def target_online(settings: Settings, name: str) -> bool:
-    """Whether a target can be written to right now. The default target only
-    needs its directory; any other target must carry the marker file at its
-    root — an unmounted NFS share is just an empty local directory, and
-    writing a 300 GB repo into that would fill the root disk."""
+    """Whether a target can be written to right now. The default target is
+    always online (load_settings created and write-checked it); any other
+    target must carry the marker file at its root — an unmounted NFS share is
+    just an empty local directory, and writing a 300 GB repo into that would
+    fill the root disk."""
     path = settings.target_dir(name)
+    if name == settings.default_target:
+        return True
     try:
-        if name == settings.default_target:
-            return path.is_dir()
         return (path / MARKER).is_file()
     except OSError:          # e.g. a soft-mounted share timing out
         return False

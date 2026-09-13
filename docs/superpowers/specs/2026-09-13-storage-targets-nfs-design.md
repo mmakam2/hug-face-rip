@@ -44,7 +44,8 @@ A non-default target is **online** iff `<path>/.hug-face-rip` is a regular file
 mount. Without it (share not mounted, NAS down, wrong path) the target is
 offline: `POST /api/jobs` for it is refused with 409, the dispatcher does not
 claim its queued jobs (they show as *held · target offline*), and the storage
-panel greys it out. The default target is online iff its directory exists.
+panel greys it out. The default target is always online (startup created and
+write-checked it; the worker creates repo subdirectories itself).
 
 Why a marker and not `ismount`: it is filesystem-agnostic, testable with a
 tmp dir, and also catches "mounted the wrong export".
