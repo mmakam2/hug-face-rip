@@ -1,0 +1,10 @@
+[Unit]
+Description=Automount TrueNAS NFS export for hug-face-rip backups
+# Mounts on first access and re-mounts after an outage without operator action.
+# Enable this unit (not the .mount) so boot never waits on the NAS.
+
+[Automount]
+Where=/mnt/truenas
+
+[Install]
+WantedBy=multi-user.target

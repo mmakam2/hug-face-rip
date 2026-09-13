@@ -19,6 +19,12 @@ WorkingDirectory=/root/hug-face-rip
 # override existing vars — so they tune this host (10 GB RAM).
 Environment=HOST=0.0.0.0
 Environment=PORT=8000
+# Named storage targets; the first is the default. 'truenas' is the NFS export
+# mounted by mnt-truenas.(auto)mount and is only usable while
+# /mnt/truenas/.hug-face-rip exists (i.e. the share is really mounted) — the app
+# refuses to write into an unmounted path. No RequiresMountsFor on purpose: the
+# app must start with the NAS down (local downloads keep working).
+Environment=BACKUP_TARGETS=local=/mnt/zfshug,truenas=/mnt/truenas
 Environment=MAX_CONCURRENT_JOBS=1
 Environment=MAX_WORKERS=2
 # Xet is the fast downloader, but its adaptive concurrency can balloon memory.

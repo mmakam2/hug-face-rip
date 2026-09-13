@@ -1,0 +1,16 @@
+[Unit]
+Description=TrueNAS NFS export for hug-face-rip backups
+# Soft mount + short timeouts: if the NAS goes away, I/O returns errors (the app
+# retries the job with backoff) instead of hanging the progress poller and the
+# dashboard's storage endpoint in uninterruptible sleep. retry=0: a failed mount
+# attempt returns at once instead of retrying for minutes under the automount.
+# The unit name must match the mount point: /mnt/truenas -> mnt-truenas.mount.
+
+[Mount]
+What=truenas.babendums.com:/mnt/RAIDZ1_1TB/hug-face-rip
+Where=/mnt/truenas
+Type=nfs4
+Options=soft,timeo=50,retrans=2,retry=0,noatime,_netdev
+
+[Install]
+WantedBy=multi-user.target

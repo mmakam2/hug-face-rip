@@ -28,7 +28,8 @@ Integration tests are **excluded by default** (`pytest.ini` sets `-m "not integr
 `-m integration` to opt in. There is no linter configured.
 
 `.env` holds secrets (HF token) — **do not read it**; reference variables by name. Required:
-`HUGGINGFACE_ACCESS_KEY`, `BACKUP_DIR`. Optional: `MAX_CONCURRENT_JOBS` (default 2), `MAX_WORKERS`
+`HUGGINGFACE_ACCESS_KEY`, `BACKUP_DIR`. Optional: `BACKUP_TARGETS` (`name=path,…`, first is
+default; overrides `BACKUP_DIR`), `MAX_CONCURRENT_JOBS` (default 2), `MAX_WORKERS`
 (default 8), `DB_PATH` (default `jobs.db`), `STALL_TIMEOUT_SECONDS` (default 600; 0 disables the
 stall watchdog). See `.env.example`.
 
@@ -45,7 +46,11 @@ Request/data flow across the modules:
   token, creates/writes-checks `BACKUP_DIR`, raises `ConfigError` on bad input. `verify_downloads`
   (env `VERIFY_DOWNLOADS`, default on) gates the automatic post-download integrity check.
   `stall_timeout` (env `STALL_TIMEOUT_SECONDS`, default 600; 0 disables) is the no-disk-progress
-  window after which the poller's stall watchdog terminates a hung download.
+  window after which the poller's stall watchdog terminates a hung download. **Storage targets:**
+  `targets` (ordered `name → Path`, from `BACKUP_TARGETS`, else `{"local": BACKUP_DIR}`),
+  `default_target`, `target_dir(name)`; only the default target is created at startup.
+  `target_online(settings, name)`: the default is always online, any other target needs the
+  `MARKER` file (`.hug-face-rip`) at its root.
 - **`db.py`** — `JobStore` wraps **one** SQLite connection shared across threads (a `threading.Lock`
   guards every call; `check_same_thread=False`). `Job` has a computed `percent`. Status lifecycle:
   `queued → running → verifying → completed | failed | paused | retrying`, plus a terminal-ish
@@ -64,7 +69,10 @@ Request/data flow across the modules:
   `retry_count`/`next_retry_at`, then `verify_status`/`verify_detail`) and seeds the `app_state`
   table, which holds the persistent global Pause/Play **valve** (`paused_all`).
   `reset_verifying_to_completed()` rescues a job orphaned mid-verification on startup (→
-  `completed`/`unverified`, bar restored). `UNIQUE(repo_type, slug)` means one row per repo+type.
+  `completed`/`unverified`, bar restored). `UNIQUE(repo_type, slug)` means one row per repo+type
+  (a repo lives on exactly one target). `target` names the storage target holding the files
+  (migration adds it with the configured default; `JobStore(db_path, default_target=…)`);
+  `next_runnable_job(targets=…)` and `pending_bytes(target=…)` filter by it.
 - **`backup.py`** — the worker engine. A **central dispatcher** loop (`JobRunner.start()`) is the
   only thing that starts downloads: while the valve is open and a slot is free (`running_count <
   max_concurrent_jobs`, counting `running` + `verifying`) it claims the lowest-id eligible job
@@ -89,6 +97,11 @@ Request/data flow across the modules:
   fresh progress/verify/retry state. An rmtree error lands the job at `failed` ("could not delete
   files: …"; Retry re-downloads the half-removed tree). `JobRunner.delete(job_id, requeue=False)`
   is the entry point; the worker's running-`cancel` branch uses it too, freeing the slot at once.
+  **Every path is resolved through `settings.target_dir(job.target)`** (download dir, pre-flight
+  free-space check, verify, delete). The dispatcher passes the currently online target names to
+  `next_runnable_job`, so jobs on an unmounted share stay queued; a target vanishing between claim
+  and start raises `TargetOffline` → transient failure (`retrying`). `retry.py` also treats
+  `EIO`/`ESTALE`/`ENOTCONN`/`EHOSTDOWN` as transient for a share dropping mid-transfer.
 - **`verify.py`** — the pure, offline-testable hash core: `sha256_file`, `git_blob_sha1`,
   `expected_file_hashes` (maps repo siblings to per-file algo+hash), and
   `verify_repo(local_dir, expected, stop, on_progress) → VerifyReport`. LFS files verify by SHA256,
@@ -100,7 +113,9 @@ Request/data flow across the modules:
   the dispatcher (the auto-resume mechanism, valve permitting). `delete`, non-running `cancel`, and
   `redownload` return `{"deleting": id}` at once. `configure_logging()` (called from `__main__`)
   sends `app.*` INFO lines to stderr/journal, and an HTTP middleware logs every **non-GET request on
-  arrival**. Endpoints: `POST/GET /api/jobs`,
+  arrival**. `POST /api/jobs` takes `{slug, target?}` (400 unknown target, 409 offline target);
+  `GET /api/storage` keeps its top-level fields (the default target) and adds `targets: [{name,
+  path, default, online, total, used, free, planned}]`. Endpoints: `POST/GET /api/jobs`,
   `GET /api/storage` (includes `planned` and `paused_all`), `POST
   /api/jobs/{id}/retry|pause|resume|cancel|delete|verify|stop-verify|redownload`, and `POST
   /api/pause-all|resume-all` (the global valve).
@@ -130,7 +145,12 @@ Request/data flow across the modules:
    uvicorn configures only its own loggers: without `configure_logging()` nothing below WARNING from
    `app.*` reaches the journal (WARNINGs only appeared via Python's last-resort handler).
 
-4. **Integrity uses two hash algorithms.** The Hub reports SHA256 only for LFS-tracked files
+4. **An unmounted share is an empty local directory.** Nothing stops a write into `/mnt/truenas`
+   when the NFS mount is absent except the marker rule: non-default targets are offline unless
+   `<path>/.hug-face-rip` exists. Never `mkdir` a non-default target, never auto-create the marker,
+   and keep the online check on every write path (submit, dispatch, worker start).
+
+5. **Integrity uses two hash algorithms.** The Hub reports SHA256 only for LFS-tracked files
    (`sibling.lfs.sha256`); plain git files carry only a git blob OID (`sibling.blob_id`, a SHA1 over
    `"blob <len>\0" + bytes`), so `verify_repo` checks each with the right one. And **cannot-verify ≠
    corrupted**: if the Hub lookup for reference hashes fails, the job stays `completed`/`unverified`
@@ -162,6 +182,16 @@ spawned Python child process, so `MAX_CONCURRENT_JOBS` multiplies whole-process 
 `MemoryMax` still bounds the total because child processes inherit the parent's systemd cgroup.
 Importantly, an OOM kill now most likely terminates a single download child rather than the whole
 server — that job lands in `failed` (retryable, partial files kept) and the dashboard stays up.
+
+**TrueNAS NFS target:** `deploy/mnt-truenas.mount` + `deploy/mnt-truenas.automount` mount
+`truenas.babendums.com:/mnt/RAIDZ1_1TB/hug-face-rip` at `/mnt/truenas` (NFSv4, `soft,timeo=50,
+retrans=2,retry=0` so an outage returns errors instead of hanging the poller/storage endpoint; the
+automount re-mounts on next access). The service unit sets `BACKUP_TARGETS=local=/mnt/zfshug,
+truenas=/mnt/truenas` and deliberately has no `RequiresMountsFor`. Install: `apt-get install -y
+nfs-common`, copy both units, `systemctl enable --now mnt-truenas.automount`, `ls /mnt/truenas`,
+`touch /mnt/truenas/.hug-face-rip`. While the NAS is unreachable, calls that touch it can take up
+to ~10 s each, so the storage panel and the dispatcher tick slow down; local downloads continue.
+The container is unconfined LXC with full caps, so it mounts NFS itself.
 
 Binding to `0.0.0.0` (the default) exposes an **unauthenticated** dashboard that downloads using
 your HF token — only run on a trusted network, or set `HOST=127.0.0.1`.
