@@ -15,7 +15,10 @@ from .db import (
     COMPLETED, DELETING, FAILED, JobStore, PAUSED, QUEUED, RETRYING, RUNNING, VERIFYING,
 )
 
-logger = logging.getLogger(__name__)
+# Named explicitly, not via __name__: the service runs `python -m app.main`, which
+# makes this module `__main__` — outside the `app` hierarchy configure_logging()
+# attaches its handler to, so INFO lines from here would never reach the journal.
+logger = logging.getLogger("app.main")
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 

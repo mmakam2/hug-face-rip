@@ -1,3 +1,4 @@
+import pytest
 from app.main import server_host_port
 
 
@@ -31,6 +32,31 @@ def test_configure_logging_sends_app_info_lines_to_stderr_once(capsys):
         err = capsys.readouterr().err
         assert err.count("deleted x/y") == 1
         assert err.startswith("INFO:")             # matches uvicorn's line style
+    finally:
+        for h in app_logger.handlers[:]:
+            if h not in before:
+                app_logger.removeHandler(h)
+        app_logger.setLevel(logging.NOTSET)
+
+
+# runpy warns that app.main is already imported (by the other tests); re-executing
+# it as __main__ is exactly the launch we are reproducing, so that is expected.
+@pytest.mark.filterwarnings("ignore:.*found in sys.modules.*:RuntimeWarning")
+def test_running_as_main_module_keeps_request_logger_under_app(monkeypatch):
+    # The service is launched with `python -m app.main`, which executes the
+    # module as `__main__`. A logger named via __name__ would then sit outside
+    # the `app` hierarchy that configure_logging() attaches its handler to, and
+    # the arrival lines for POSTs would silently vanish from the journal.
+    import logging
+    import runpy
+    import uvicorn
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)   # don't start a server
+    app_logger = logging.getLogger("app")
+    before = list(app_logger.handlers)
+    try:
+        g = runpy.run_module("app.main", run_name="__main__")
+        assert g["logger"].name == "app.main"
+        assert g["logger"].getEffectiveLevel() == logging.INFO   # handler + level apply
     finally:
         for h in app_logger.handlers[:]:
             if h not in before:
