@@ -387,7 +387,8 @@ def test_worker_cancel_deletes_files_and_row(tmp_path):
     registry.request(job.id, "cancel")
     t.join(5)
 
-    assert store.get_job(job.id) is None                                   # row gone
+    assert store.running_count() == 0            # slot freed as soon as the child died
+    assert wait_until(lambda: store.get_job(job.id) is None)               # row gone
     assert not (tmp_path / "backups" / "models" / "o" / "n").exists()      # files gone
     store.close()
 
@@ -423,7 +424,7 @@ def test_worker_self_terminates_when_intent_set_before_registration(tmp_path):
                    launcher=InThreadLauncher(blocking_downloader_factory(started)),
                    registry=registry)
 
-    assert store.get_job(job.id) is None          # cancelled despite early intent
+    assert wait_until(lambda: store.get_job(job.id) is None)   # cancelled despite early intent
     store.close()
 
 
@@ -814,4 +815,152 @@ def test_verify_aborts_on_preset_stop_intent(tmp_path):
     assert j.status == COMPLETED
     assert j.verify_status == "unverified"             # interrupted -> inconclusive
     assert j.downloaded_bytes == j.total_bytes
+    store.close()
+
+
+# --- background deletion ('deleting' status) ---
+
+def _completed_with_files(store, settings, slug="o/n", files=None):
+    files = files or {"a.bin": b"a" * 100, "b.bin": b"b" * 50}
+    return _write_completed_repo(store, settings, slug, files)
+
+
+def test_run_delete_job_removes_files_and_row(tmp_path, caplog):
+    from app.backup import run_delete_job
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = _completed_with_files(store, settings)
+    d = local_dir_for(settings.backup_dir, "model", "o/n")
+    with caplog.at_level(logging.INFO, logger="app.backup"):
+        run_delete_job(job.id, store, settings)
+    assert store.get_job(job.id) is None          # row gone
+    assert not d.exists()                          # files gone
+    # The outcome must leave a trail in the journal, not just vanish from the DB.
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("deleted" in m and "o/n" in m for m in msgs), msgs
+    store.close()
+
+
+def test_run_delete_job_reports_shrinking_bytes_while_deleting(tmp_path, monkeypatch):
+    # The dashboard bar should drain as files disappear: the deleter polls
+    # directory_size into downloaded_bytes exactly like the download poller.
+    from app.backup import run_delete_job
+    import app.backup as backup_mod
+    monkeypatch.setattr(backup_mod, "POLL_INTERVAL", 0.01)
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = _completed_with_files(store, settings, files={"a.bin": b"a" * 100, "b.bin": b"b" * 50})
+    d = local_dir_for(settings.backup_dir, "model", "o/n")
+    seen = []
+    real_update = store.update_progress
+    store.update_progress = lambda job_id, n, total_bytes=None: (seen.append(n), real_update(job_id, n, total_bytes))
+
+    def slow_remover(backup_dir, repo_type, slug):
+        (d / "a.bin").unlink()
+        time.sleep(0.2)                   # poller samples the half-deleted tree
+        (d / "b.bin").unlink()
+        d.rmdir()
+
+    run_delete_job(job.id, store, settings, remover=slow_remover)
+    assert 50 in seen, seen               # an intermediate, smaller size was reported
+    assert store.get_job(job.id) is None
+    store.close()
+
+
+def test_run_delete_job_requeue_lands_at_queued_with_fresh_state(tmp_path):
+    from app.backup import run_delete_job
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = _completed_with_files(store, settings)
+    store.set_verify_status(job.id, "corrupted", detail='{"failures": []}')
+    store.schedule_retry(job.id, "old", 1)          # stale retry state to be cleared
+    store.set_status(job.id, COMPLETED)
+    d = local_dir_for(settings.backup_dir, "model", "o/n")
+    run_delete_job(job.id, store, settings, requeue=True)
+    j = store.get_job(job.id)
+    assert j is not None and j.status == QUEUED     # row kept, back in the queue
+    assert j.downloaded_bytes == 0 and j.total_bytes == 150
+    assert j.verify_status == "unverified" and j.verify_detail is None
+    assert j.retry_count == 0 and j.next_retry_at is None
+    assert not d.exists()
+    store.close()
+
+
+def test_run_delete_job_failure_marks_failed_and_logs(tmp_path, caplog):
+    from app.backup import run_delete_job
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = _completed_with_files(store, settings)
+    store.set_verify_status(job.id, "verified")
+
+    def broken_remover(backup_dir, repo_type, slug):
+        raise OSError(5, "Input/output error")
+
+    with caplog.at_level(logging.INFO, logger="app.backup"):
+        run_delete_job(job.id, store, settings, remover=broken_remover)
+    j = store.get_job(job.id)
+    assert j.status == FAILED
+    assert "could not delete files" in j.error and "Input/output error" in j.error
+    assert j.verify_status == "unverified"          # tree may be half-removed
+    errs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errs and "o/n" in errs[0].getMessage()
+    store.close()
+
+
+def test_start_delete_marks_deleting_before_returning(tmp_path):
+    from app.backup import start_delete
+    from app.db import DELETING
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = _completed_with_files(store, settings)
+    release = threading.Event()
+
+    def gated_remover(backup_dir, repo_type, slug):
+        release.wait(5)
+        local_dir_for(backup_dir, repo_type, slug)  # keep signature honest
+        import shutil
+        shutil.rmtree(local_dir_for(backup_dir, repo_type, slug))
+
+    t = start_delete(job.id, store, settings, remover=gated_remover)
+    assert store.get_job(job.id).status == DELETING     # visible on the very next poll
+    assert t.daemon                                      # never delays process exit
+    release.set()
+    t.join(5)
+    assert store.get_job(job.id) is None
+    store.close()
+
+
+def test_runner_delete_runs_without_the_download_executor(tmp_path):
+    # Deletion is disk I/O; it must not queue behind (or hold) a download slot,
+    # so it works even when the dispatcher/executor has not been started.
+    from app.db import DELETING
+    settings = make_settings(tmp_path, max_jobs=1)
+    store = JobStore(settings.db_path)
+    job = _completed_with_files(store, settings)
+    d = local_dir_for(settings.backup_dir, "model", "o/n")
+    runner = JobRunner(store, settings)
+    runner.delete(job.id)
+    assert store.get_job(job.id) is None or store.get_job(job.id).status == DELETING
+    assert wait_until(lambda: store.get_job(job.id) is None)
+    assert not d.exists()
+    runner.shutdown()
+    store.close()
+
+
+def test_runner_shutdown_does_not_wait_for_an_inflight_delete(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    job = _completed_with_files(store, settings)
+    release = threading.Event()
+
+    def gated_remover(backup_dir, repo_type, slug):
+        release.wait(5)
+
+    runner = JobRunner(store, settings, remover=gated_remover)
+    t = runner.delete(job.id)
+    t0 = time.monotonic()
+    runner.shutdown()
+    assert time.monotonic() - t0 < 1.0             # returned while rmtree still "running"
+    release.set()
+    t.join(5)                                      # let it finish before the store closes
     store.close()

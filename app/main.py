@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import shutil
@@ -8,9 +9,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .backup import JobRunner, detect_repo_types, repo_total_bytes, delete_backup_files
+from .backup import JobRunner, detect_repo_types, repo_total_bytes
 from .config import load_settings
-from .db import COMPLETED, FAILED, JobStore, PAUSED, QUEUED, RETRYING, RUNNING, VERIFYING
+from .db import (
+    COMPLETED, DELETING, FAILED, JobStore, PAUSED, QUEUED, RETRYING, RUNNING, VERIFYING,
+)
+
+logger = logging.getLogger(__name__)
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -28,6 +33,10 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         # go back to 'queued'; the dispatcher then drives everything per the valve.
         store.reset_running_to_queued()
         store.reset_verifying_to_completed()
+        # A restart mid-rmtree leaves a 'deleting' row and a half-removed tree:
+        # finish the job (rmtree is idempotent) instead of letting it linger.
+        for job in store.deleting_jobs():
+            runner.delete(job.id)
         runner.start()
         yield
         # On shutdown (e.g. systemd restart), stop the dispatcher and terminate
@@ -36,6 +45,18 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
         runner.shutdown()
 
     app = FastAPI(title="Hugging Face Rip", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def log_actions_on_arrival(request, call_next):
+        # uvicorn's access line is written only when the response is sent — and
+        # skipped entirely if the client has gone away by then. A slow action
+        # whose caller gave up (a browser abandoning a long delete) would leave
+        # no trace, so log every state-changing request the moment it arrives.
+        # GETs are the dashboard's 1.5s polling; uvicorn already logs those.
+        if request.method != "GET":
+            client = request.client.host if request.client else "-"
+            logger.info("%s %s from %s", request.method, request.url.path, client)
+        return await call_next(request)
 
     @app.get("/")
     def index():
@@ -67,8 +88,8 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
                     store.update_progress(job.id, 0, total_bytes=total)
                     job = store.get_job(job.id)
                 # Left 'queued'; the dispatcher will start it.
-            elif existing.status in (RUNNING, QUEUED, RETRYING, PAUSED):
-                # In progress / pending / paused -> don't disturb.
+            elif existing.status in (RUNNING, QUEUED, RETRYING, PAUSED, DELETING):
+                # In progress / pending / paused / being deleted -> don't disturb.
                 job = existing
             else:
                 # completed / failed -> requeue with a fresh retry budget.
@@ -136,14 +157,13 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
                 detail="only queued, running, paused, or retrying jobs can be cancelled",
             )
         if job.status == RUNNING:
-            # Hand off to the runner; the worker deletes files + row once the
-            # child process dies (near-instant, even mid-file).
+            # Hand off to the runner; once the child process dies (near-instant,
+            # even mid-file) the worker starts the background delete.
             runner.cancel(job_id)
             return {"cancelling": job_id}
-        # queued / paused / retrying: no live process — discard files + row directly.
-        delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
-        store.delete_job(job_id)
-        return {"deleted": job_id}
+        # queued / paused / retrying: no live process — straight to the deleter.
+        runner.delete(job_id)
+        return {"deleting": job_id}
 
     @app.post("/api/jobs/{job_id}/verify")
     def verify(job_id: int):
@@ -172,11 +192,9 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
             raise HTTPException(status_code=404, detail="job not found")
         if job.verify_status != "corrupted":
             raise HTTPException(status_code=409, detail="only corrupted downloads can be re-downloaded")
-        delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
-        store.requeue(job_id)
-        store.reset_retry(job_id)
-        store.set_verify_status(job_id, "unverified", detail=None)
-        return store.get_job(job_id).to_dict()
+        # Discard in the background, then the deleter requeues it for a fresh run.
+        runner.delete(job_id, requeue=True)
+        return {"deleting": job_id}
 
     @app.post("/api/pause-all")
     def pause_all():
@@ -195,9 +213,10 @@ def create_app(settings, store, runner, detect=detect_repo_types, sizer=repo_tot
             raise HTTPException(status_code=404, detail="job not found")
         if job.status != COMPLETED:
             raise HTTPException(status_code=409, detail="only completed downloads can be deleted")
-        delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
-        store.delete_job(job_id)
-        return {"deleted": job_id}
+        # Returns at once; the row shows 'deleting' (bar draining) until the
+        # files are gone, then disappears. Unlinking hundreds of GB takes minutes.
+        runner.delete(job_id)
+        return {"deleting": job_id}
 
     return app
 
@@ -212,6 +231,21 @@ def build_default_app() -> FastAPI:
     return create_app(settings, store, runner)
 
 
+def configure_logging() -> None:
+    """Send the app's INFO lines to stderr (the journal under systemd), in
+    uvicorn's line style. uvicorn configures only its own loggers, so without
+    this nothing below WARNING from `app.*` was ever visible. Idempotent, and
+    scoped to the `app` logger so third-party libraries stay quiet."""
+    app_logger = logging.getLogger("app")
+    if any(getattr(h, "_hug_face_rip", False) for h in app_logger.handlers):
+        return
+    handler = logging.StreamHandler()
+    handler._hug_face_rip = True
+    handler.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
+    app_logger.addHandler(handler)
+    app_logger.setLevel(logging.INFO)
+
+
 def server_host_port(env=None):
     """Resolve the server bind address. Defaults to all interfaces (0.0.0.0:8000);
     override with the HOST and PORT environment variables."""
@@ -224,5 +258,6 @@ def server_host_port(env=None):
 if __name__ == "__main__":
     import uvicorn
 
+    configure_logging()
     host, port = server_host_port()
     uvicorn.run(build_default_app, host=host, port=port, factory=True)

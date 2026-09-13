@@ -1,12 +1,14 @@
 import pytest
 from fastapi.testclient import TestClient
 from app.config import Settings
-from app.db import JobStore, FAILED, QUEUED, PAUSED, RUNNING, RETRYING, COMPLETED, VERIFYING
+from app.db import JobStore, FAILED, QUEUED, PAUSED, RUNNING, RETRYING, COMPLETED, VERIFYING, DELETING
 from app.main import create_app
 
 
 class FakeRunner:
-    def __init__(self):
+    def __init__(self, store=None):
+        self.store = store
+        self.deleted = []            # (job_id, requeue) hand-offs
         self.started = False
         self.paused = []
         self.cancelled = []
@@ -25,6 +27,12 @@ class FakeRunner:
     def cancel(self, job_id):
         self.cancelled.append(job_id)
         return True
+
+    def delete(self, job_id, requeue=False):
+        # Real JobRunner.delete marks the row 'deleting' before returning.
+        self.deleted.append((job_id, requeue))
+        if self.store is not None:
+            self.store.set_status(job_id, DELETING)
 
     def verify(self, job_id):
         self.verified.append(job_id)
@@ -60,7 +68,7 @@ def ctx(tmp_path):
     settings = make_settings(tmp_path)
     settings.backup_dir.mkdir(parents=True, exist_ok=True)
     store = JobStore(settings.db_path)
-    runner = FakeRunner()
+    runner = FakeRunner(store)
     detect = lambda slug, token: ["model", "dataset"] if slug == "o/n" else []
     sizer = lambda slug, repo_type, token: FAKE_SIZE
     app = create_app(settings, store, runner, detect=detect, sizer=sizer)
@@ -146,13 +154,14 @@ def test_retry_only_failed(ctx):
     assert store.get_job(job.id).status == QUEUED   # the dispatcher will pick it up
 
 
-def test_cancel_removes_queued_job_from_the_list(ctx):
+def test_cancel_queued_job_hands_off_to_deleter(ctx):
     client, store, runner = ctx
     job = store.create_job("a/b", "model")
     resp = client.post(f"/api/jobs/{job.id}/cancel")
     assert resp.status_code == 200
-    assert store.get_job(job.id) is None                  # deleted, not just flagged
-    assert client.get("/api/jobs").json()["jobs"] == []   # leaves the list
+    assert runner.deleted == [(job.id, False)]            # deleter removes files + row
+    listed = client.get("/api/jobs").json()["jobs"]
+    assert [j["status"] for j in listed] == [DELETING]    # visible until it is gone
 
 
 def test_cancel_running_job_terminates_it(ctx):
@@ -169,6 +178,7 @@ def test_readd_after_cancel_does_not_resurrect_cancelled_instances(ctx):
     client.post("/api/jobs", json={"slug": "o/n"})        # model + dataset, queued
     for j in store.list_jobs():
         client.post(f"/api/jobs/{j.id}/cancel")            # cancel both
+        store.delete_job(j.id)                             # ...as the deleter would finish
     assert store.list_jobs() == []                         # all gone
     client.post("/api/jobs", json={"slug": "o/n"})        # re-add the same slug
     jobs = store.list_jobs()
@@ -227,7 +237,7 @@ def test_storage_reports_planned_bytes(ctx):
     assert client.get("/api/storage").json()["planned"] == 160   # 100 + 60
 
 
-def test_delete_completed_job_removes_files_and_row(ctx, tmp_path):
+def test_delete_hands_off_to_the_background_deleter(ctx, tmp_path):
     client, store, runner = ctx
     from app.backup import local_dir_for
     backup = tmp_path / "backups"                       # ctx's settings.backup_dir
@@ -238,8 +248,47 @@ def test_delete_completed_job_removes_files_and_row(ctx, tmp_path):
     store.set_status(job.id, "completed")
     resp = client.post(f"/api/jobs/{job.id}/delete")
     assert resp.status_code == 200
-    assert store.get_job(job.id) is None                # row gone
-    assert not d.exists()                                # files gone
+    assert resp.json() == {"deleting": job.id}
+    assert runner.deleted == [(job.id, False)]          # runner removes files + row
+    assert d.exists()                                    # endpoint did not rmtree inline
+
+
+def test_delete_returns_immediately_and_lists_job_as_deleting(tmp_path):
+    # End-to-end with the real runner: a slow rmtree must not block the request
+    # or hide the state — the very next poll shows 'deleting' and no actions.
+    import shutil
+    import threading
+    import time
+    from app.backup import JobRunner, local_dir_for
+    settings = make_settings(tmp_path)
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(settings.db_path)
+    release = threading.Event()
+
+    def slow_remover(backup_dir, repo_type, slug):
+        release.wait(5)
+        shutil.rmtree(local_dir_for(backup_dir, repo_type, slug))
+
+    runner = JobRunner(store, settings, remover=slow_remover)
+    app = create_app(settings, store, runner, detect=lambda s, t: [])
+    job = store.create_job("big/repo", "model")
+    d = local_dir_for(settings.backup_dir, "model", "big/repo")
+    d.mkdir(parents=True)
+    (d / "huge.bin").write_bytes(b"x" * 1000)
+    store.set_status(job.id, COMPLETED)
+    store.update_progress(job.id, 1000, total_bytes=1000)
+    with TestClient(app) as client:
+        assert client.post(f"/api/jobs/{job.id}/delete").status_code == 200
+        listed = client.get("/api/jobs").json()["jobs"][0]
+        assert listed["status"] == DELETING              # while rmtree is still running
+        assert client.post(f"/api/jobs/{job.id}/delete").status_code == 409   # not completed any more
+        release.set()
+        deadline = time.monotonic() + 5
+        while store.get_job(job.id) is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert client.get("/api/jobs").json()["jobs"] == []   # row gone once files are
+        assert not d.exists()
+    store.close()
 
 
 def test_delete_rejects_non_completed_job(ctx, tmp_path):
@@ -323,7 +372,7 @@ def test_resume_missing_job_404(ctx):
     assert client.post("/api/jobs/999/resume").status_code == 404
 
 
-def test_cancel_paused_deletes_files_and_row(ctx, tmp_path):
+def test_cancel_paused_hands_off_to_deleter(ctx, tmp_path):
     client, store, runner = ctx
     from app.backup import local_dir_for
     backup = tmp_path / "backups"
@@ -334,12 +383,12 @@ def test_cancel_paused_deletes_files_and_row(ctx, tmp_path):
     store.set_status(job.id, PAUSED)
     resp = client.post(f"/api/jobs/{job.id}/cancel")
     assert resp.status_code == 200
-    assert store.get_job(job.id) is None      # row gone
-    assert not d.exists()                      # files gone
-    assert runner.cancelled == []              # no live process; deleted directly
+    assert resp.json() == {"deleting": job.id}
+    assert runner.deleted == [(job.id, False)]   # background deleter removes files + row
+    assert runner.cancelled == []                # no live process to terminate
 
 
-def test_cancel_queued_deletes_partial_files(ctx, tmp_path):
+def test_cancel_queued_hands_off_partial_files_to_deleter(ctx, tmp_path):
     client, store, runner = ctx
     from app.backup import local_dir_for
     backup = tmp_path / "backups"
@@ -349,8 +398,8 @@ def test_cancel_queued_deletes_partial_files(ctx, tmp_path):
     (d / "partial.bin").write_bytes(b"x" * 10)
     resp = client.post(f"/api/jobs/{job.id}/cancel")
     assert resp.status_code == 200
-    assert store.get_job(job.id) is None
-    assert not d.exists()
+    assert runner.deleted == [(job.id, False)]
+    assert store.get_job(job.id).status == DELETING
 
 
 def test_startup_does_not_resume_paused_jobs(tmp_path):
@@ -382,7 +431,7 @@ def test_storage_reports_paused_all_flag(ctx):
     assert client.get("/api/storage").json()["paused_all"] is True
 
 
-def test_cancel_retrying_deletes_files_and_row(ctx, tmp_path):
+def test_cancel_retrying_hands_off_to_deleter(ctx, tmp_path):
     client, store, runner = ctx
     from app.backup import local_dir_for
     backup = tmp_path / "backups"
@@ -393,8 +442,7 @@ def test_cancel_retrying_deletes_files_and_row(ctx, tmp_path):
     store.schedule_retry(job.id, "blip", 30)            # status retrying
     resp = client.post(f"/api/jobs/{job.id}/cancel")
     assert resp.status_code == 200
-    assert store.get_job(job.id) is None
-    assert not d.exists()
+    assert runner.deleted == [(job.id, False)]
     assert runner.cancelled == []                        # no live process during backoff
 
 
@@ -435,7 +483,7 @@ def test_stop_verify_only_verifying(ctx):
     assert job.id in runner.stop_verified
 
 
-def test_redownload_only_corrupted_deletes_and_requeues(ctx, tmp_path):
+def test_redownload_only_corrupted_hands_off_with_requeue(ctx, tmp_path):
     client, store, runner = ctx
     from app.backup import local_dir_for
     backup = tmp_path / "backups"
@@ -448,11 +496,9 @@ def test_redownload_only_corrupted_deletes_and_requeues(ctx, tmp_path):
     store.set_verify_status(job.id, "corrupted", detail='{"failures": []}')
     resp = client.post(f"/api/jobs/{job.id}/redownload")
     assert resp.status_code == 200
-    j = store.get_job(job.id)
-    assert j.status == QUEUED
-    assert j.verify_status == "unverified"
-    assert j.verify_detail is None
-    assert not d.exists()                          # corrupt files discarded
+    assert resp.json() == {"deleting": job.id}
+    assert runner.deleted == [(job.id, True)]      # deleter discards files, then requeues
+    assert d.exists()                              # not removed inline
 
 
 def test_redownload_missing_job_404(ctx):
@@ -483,3 +529,45 @@ def test_startup_resets_orphaned_verifying(tmp_path):
     assert g.status == COMPLETED and g.verify_status == "unverified"
     assert g.downloaded_bytes == 10
     store.close()
+
+
+def test_startup_resubmits_orphaned_deleting_jobs(tmp_path):
+    # A restart mid-rmtree leaves a 'deleting' row and a half-removed tree; the
+    # startup hook must finish the job rather than let it linger forever.
+    settings = make_settings(tmp_path)
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(settings.db_path)
+    j = store.create_job("half/gone", "model")
+    store.set_status(j.id, DELETING)
+    runner = FakeRunner(store)
+    app = create_app(settings, store, runner, detect=lambda s, t: [])
+    with TestClient(app):
+        pass
+    assert runner.deleted == [(j.id, False)]
+    store.close()
+
+
+def test_readd_of_a_deleting_repo_does_not_requeue_it(ctx):
+    client, store, runner = ctx
+    j = store.create_job("o/n", "model")
+    store.set_status(j.id, DELETING)
+    resp = client.post("/api/jobs", json={"slug": "o/n"})   # detect -> model + dataset
+    assert resp.status_code == 200
+    assert store.get_job(j.id).status == DELETING            # left to the deleter
+    by_type = {job["repo_type"]: job for job in resp.json()["jobs"]}
+    assert by_type["model"]["status"] == DELETING
+    assert by_type["dataset"]["status"] == QUEUED             # the other type is new
+
+
+def test_mutating_requests_are_logged_on_arrival(ctx, caplog):
+    # uvicorn logs a request only when its response is sent; a client that gives
+    # up on a slow action leaves no trace. Log actions when they arrive instead.
+    import logging
+    client, store, runner = ctx
+    job = store.create_job("o/n", "model")
+    with caplog.at_level(logging.INFO, logger="app.main"):
+        client.post(f"/api/jobs/{job.id}/pause")      # 409 (queued) — still logged
+        client.get("/api/jobs")                       # polling noise: not logged here
+    msgs = [r.getMessage() for r in caplog.records if r.name == "app.main"]
+    assert any(m.startswith("POST") and f"/api/jobs/{job.id}/pause" in m for m in msgs), msgs
+    assert not any("GET" in m for m in msgs), msgs
