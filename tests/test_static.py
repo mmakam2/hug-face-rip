@@ -77,3 +77,10 @@ def test_verify_ui_present(client):
     assert "/verify" in page or "'verify'" in page  # manual verify wired
     assert ".st.verifying" in page        # verifying status color rule
     assert ".vbadge" in page              # verify badge style
+
+
+def test_deleting_rows_render_without_actions(client):
+    page = client.get("/").text
+    assert ".st.deleting" in page          # deleting status has its own color rule
+    assert "deleting…" in page             # explicit in-progress label
+    assert 'j.status === "deleting"' in page  # row template branches on it (no buttons)

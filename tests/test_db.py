@@ -258,3 +258,32 @@ def test_migration_adds_verify_columns_to_old_db(tmp_path):
     assert job.verify_status == "unverified"
     assert job.verify_detail is None
     store.close()
+
+
+def test_deleting_jobs_lists_only_jobs_being_deleted(store):
+    from app.db import DELETING
+    a = store.create_job("del/a", "model")
+    b = store.create_job("keep/b", "model")
+    c = store.create_job("del/c", "dataset")
+    store.set_status(a.id, DELETING)
+    store.set_status(b.id, COMPLETED)
+    store.set_status(c.id, DELETING)
+    assert [j.id for j in store.deleting_jobs()] == [a.id, c.id]
+
+
+def test_running_count_ignores_deleting(store):
+    # A deletion is disk I/O, not a download: it must not occupy a concurrency slot.
+    from app.db import DELETING
+    a = store.create_job("del/a", "model")
+    b = store.create_job("run/b", "model")
+    store.set_status(a.id, DELETING)
+    store.set_status(b.id, RUNNING)
+    assert store.running_count() == 1
+
+
+def test_deleting_job_is_not_runnable(store):
+    from app.db import DELETING
+    a = store.create_job("del/a", "model")
+    store.set_status(a.id, DELETING)
+    assert store.next_runnable_job() is None
+    assert store.unfinished_jobs() == []

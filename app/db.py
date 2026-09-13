@@ -11,6 +11,7 @@ PAUSED = "paused"
 RETRYING = "retrying"
 CANCELLED = "cancelled"
 VERIFYING = "verifying"
+DELETING = "deleting"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -251,6 +252,15 @@ class JobStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY id"
+            ).fetchall()
+        return [self._to_job(r) for r in rows]
+
+    def deleting_jobs(self) -> List[Job]:
+        """Jobs whose files are being removed (or were, when the process died);
+        the startup hook re-submits these so a half-removed tree never lingers."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE status = 'deleting' ORDER BY id"
             ).fetchall()
         return [self._to_job(r) for r in rows]
 

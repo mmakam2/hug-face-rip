@@ -48,7 +48,8 @@ Request/data flow across the modules:
   window after which the poller's stall watchdog terminates a hung download.
 - **`db.py`** — `JobStore` wraps **one** SQLite connection shared across threads (a `threading.Lock`
   guards every call; `check_same_thread=False`). `Job` has a computed `percent`. Status lifecycle:
-  `queued → running → verifying → completed | failed | paused | retrying`. A **transient** failure (DNS,
+  `queued → running → verifying → completed | failed | paused | retrying`, plus a terminal-ish
+  `deleting` while a job's files are being removed. A **transient** failure (DNS,
   connection drop, timeout, 5xx/429 — classified by `app/retry.py` against httpx) auto-retries up
   to 5× with backoff `30s/60s/2m/4m/8m` (status `retrying`, `next_retry_at`); **permanent** errors
   (404/gated/bad slug/disk-full) go straight to `failed`. The transient `verifying` status (entered
@@ -56,8 +57,10 @@ Request/data flow across the modules:
   the verification **outcome** lives in `verify_status` (`unverified | verified | corrupted`) and
   `verify_detail` (JSON: `{"failures":[…]}` when corrupted, `{"note":…}` when the Hub was
   unreachable). Paused jobs are excluded from startup re-queuing and resumed manually. Cancelling
-  removes the row for queued/paused/retrying jobs and also terminates the child process for running
-  ones, discarding files. `__init__` **migrates a pre-existing `jobs` table** (adds
+  (any not-yet-completed job) and Delete (a completed one) both discard files: the row goes to
+  `deleting` **immediately** and a background deleter removes the tree, then drops the row (for a
+  running job, the child process is terminated first). `deleting_jobs()` lists rows orphaned
+  mid-deletion for the startup hook. `__init__` **migrates a pre-existing `jobs` table** (adds
   `retry_count`/`next_retry_at`, then `verify_status`/`verify_detail`) and seeds the `app_state`
   table, which holds the persistent global Pause/Play **valve** (`paused_all`).
   `reset_verifying_to_completed()` rescues a job orphaned mid-verification on startup (→
@@ -78,13 +81,26 @@ Request/data flow across the modules:
   for a completed job. **Interrupting a verify (Stop, pause-all, shutdown) always returns the job to
   `completed`/`unverified` — never deletes or requeues** (its download is already complete). Global
   pause (`pause_all`) closes the valve and requeues every running download; `resume_all` reopens it.
+  **Deletion is off the request path**: `start_delete` marks the row `deleting` and runs
+  `run_delete_job` on a **daemon thread** (not the download executor — with `MAX_CONCURRENT_JOBS=1`
+  a delete there would wait behind a multi-hour download, and daemon so a systemd stop is never
+  delayed by an in-flight rmtree). The deleter runs the same disk poller as a download so the bar
+  **drains** as files disappear, then deletes the row — or, for `redownload`, requeues the job with
+  fresh progress/verify/retry state. An rmtree error lands the job at `failed` ("could not delete
+  files: …"; Retry re-downloads the half-removed tree). `JobRunner.delete(job_id, requeue=False)`
+  is the entry point; the worker's running-`cancel` branch uses it too, freeing the slot at once.
 - **`verify.py`** — the pure, offline-testable hash core: `sha256_file`, `git_blob_sha1`,
   `expected_file_hashes` (maps repo siblings to per-file algo+hash), and
   `verify_repo(local_dir, expected, stop, on_progress) → VerifyReport`. LFS files verify by SHA256,
   plain git files by git blob SHA1.
 - **`main.py`** — HTTP API + serves the `static/` dashboard. The FastAPI **lifespan hook resets
-  orphaned `running` jobs to `queued`** and **orphaned `verifying` jobs to `completed`**, then starts
-  the dispatcher (the auto-resume mechanism, valve permitting). Endpoints: `POST/GET /api/jobs`,
+  orphaned `running` jobs to `queued`**, **orphaned `verifying` jobs to `completed`**, and
+  **re-submits orphaned `deleting` jobs** (rmtree is idempotent; note an interrupted *re-download*
+  finishes as a plain delete, since the requeue intent isn't persisted), then starts
+  the dispatcher (the auto-resume mechanism, valve permitting). `delete`, non-running `cancel`, and
+  `redownload` return `{"deleting": id}` at once. `configure_logging()` (called from `__main__`)
+  sends `app.*` INFO lines to stderr/journal, and an HTTP middleware logs every **non-GET request on
+  arrival**. Endpoints: `POST/GET /api/jobs`,
   `GET /api/storage` (includes `planned` and `paused_all`), `POST
   /api/jobs/{id}/retry|pause|resume|cancel|delete|verify|stop-verify|redownload`, and `POST
   /api/pause-all|resume-all` (the global valve).
@@ -108,7 +124,13 @@ Request/data flow across the modules:
 2. **`MAX_CONCURRENT_JOBS` × `MAX_WORKERS` multiply into memory pressure** (repos-in-parallel ×
    files-per-repo). Both are the dials for the speed/RAM tradeoff.
 
-3. **Integrity uses two hash algorithms.** The Hub reports SHA256 only for LFS-tracked files
+3. **uvicorn's access log is written when the response is sent — and skipped if the client is
+   gone.** A browser that abandons a slow request leaves *no* line in the journal; that is why the
+   `POST …/delete` middleware logs on arrival and why the deleter logs its own start/finish. Also,
+   uvicorn configures only its own loggers: without `configure_logging()` nothing below WARNING from
+   `app.*` reaches the journal (WARNINGs only appeared via Python's last-resort handler).
+
+4. **Integrity uses two hash algorithms.** The Hub reports SHA256 only for LFS-tracked files
    (`sibling.lfs.sha256`); plain git files carry only a git blob OID (`sibling.blob_id`, a SHA1 over
    `"blob <len>\0" + bytes`), so `verify_repo` checks each with the right one. And **cannot-verify ≠
    corrupted**: if the Hub lookup for reference hashes fails, the job stays `completed`/`unverified`

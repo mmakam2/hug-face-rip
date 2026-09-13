@@ -31,7 +31,7 @@ td{padding:12px 10px;border-top:1px solid var(--line);vertical-align:middle}
 .bar{height:6px;background:var(--line);border-radius:99px;overflow:hidden;min-width:130px}
 .bar>span{display:block;height:100%;background:var(--accent);transition:width .4s ease}
 .st{font-size:13px;font-weight:600;text-transform:capitalize}
-.st.completed{color:var(--ok)}.st.failed{color:var(--err)}.st.running{color:var(--accent)}.st.queued,.st.cancelled{color:var(--muted)}.st.paused{color:#d2a24c}.st.retrying{color:#d2a24c}.st.verifying{color:#d2a24c}
+.st.completed{color:var(--ok)}.st.failed{color:var(--err)}.st.running{color:var(--accent)}.st.queued,.st.cancelled{color:var(--muted)}.st.paused{color:#d2a24c}.st.retrying{color:#d2a24c}.st.verifying{color:#d2a24c}.st.deleting{color:#d2a24c}
 .vbadge{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;vertical-align:middle}
 .vbadge.ok{color:var(--ok)}.vbadge.err{color:var(--err)}.vbadge.muted{color:var(--muted)}
 .err{color:var(--err);font-size:12px;margin-top:4px;max-width:420px}
@@ -205,6 +205,8 @@ function row(j) {
     ? `<button class="ghost" onclick="act(${j.id},'retry')">Retry</button>`
     : j.status === "queued"
     ? `<button class="ghost" onclick="act(${j.id},'cancel')">Cancel</button>`
+    : j.status === "deleting"
+    ? ""   // files being removed in the background; nothing to act on until the row goes
     : j.status === "completed"
     ? (j.verify_status === "corrupted"
         ? `<button class="ghost" onclick="confirmRedownload(${j.id},'${esc(j.slug)}')">Re-download</button>`
@@ -214,6 +216,7 @@ function row(j) {
     : "";
   const label = j.status === "queued" && pausedAll ? "held"
               : j.status === "retrying" ? retryText(j)
+              : j.status === "deleting" ? "deleting…"
               : j.status;
   return `<tr>
     <td><div class="repo">${esc(j.slug)}</div><span class="badge ${esc(j.repo_type)}">${esc(j.repo_type)}</span>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}${verifyFailures(j)}</td>

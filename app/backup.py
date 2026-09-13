@@ -14,7 +14,7 @@ from huggingface_hub.utils import (
     RepositoryNotFoundError,
 )
 
-from .db import PAUSED, VERIFYING, COMPLETED
+from .db import PAUSED, VERIFYING, COMPLETED, DELETING, FAILED
 from .retry import is_retryable, BACKOFF_SECONDS, MAX_RETRIES
 from .verify import verify_repo, expected_file_hashes, VerifyAborted
 
@@ -106,6 +106,83 @@ def free_disk_bytes(path) -> int:
 
 
 POLL_INTERVAL = 1.5
+
+
+def run_delete_job(job_id, store, settings, requeue: bool = False,
+                   remover=delete_backup_files) -> None:
+    """Remove a job's files while it shows as 'deleting' (a poller drains the
+    bar as bytes disappear), then drop the row — or, for a re-download, return
+    it to the queue with fresh progress/verify/retry state.
+
+    Runs off the request path (see start_delete): unlinking a few hundred GB
+    takes minutes, and the endpoint used to block for all of it while the
+    dashboard kept showing an unchanged 'completed' card. Any error lands the
+    job at 'failed' with the reason — a half-removed tree is a broken backup,
+    and Retry (re-download) is the right recovery for it.
+    """
+    job = store.get_job(job_id)
+    if job is None:
+        return
+    store.set_status(job_id, DELETING)
+    local_dir = local_dir_for(settings.backup_dir, job.repo_type, job.slug)
+    before = directory_size(local_dir)
+    logger.info("deleting %s (%s) job %d: %.1f GB at %s",
+                job.slug, job.repo_type, job_id, before / 1e9, local_dir)
+
+    stop = threading.Event()
+
+    def _poll():
+        while not stop.is_set():
+            store.update_progress(job_id, directory_size(local_dir))
+            stop.wait(POLL_INTERVAL)
+
+    poller = threading.Thread(target=_poll, daemon=True)
+    poller.start()
+    started = time.monotonic()
+    try:
+        remover(settings.backup_dir, job.repo_type, job.slug)
+    except Exception as exc:  # noqa: BLE001 - record and surface any failure
+        stop.set()
+        poller.join(timeout=2)
+        logger.exception("could not delete files for %s (%s) job %d: %s",
+                         job.slug, job.repo_type, job_id, exc)
+        store.set_status(job_id, FAILED, error=f"could not delete files: {exc}"[:500])
+        store.set_verify_status(job_id, "unverified", detail=None)
+        return
+    stop.set()
+    poller.join(timeout=2)
+    elapsed = time.monotonic() - started
+    if requeue:
+        store.update_progress(job_id, 0)
+        store.requeue(job_id)
+        store.reset_retry(job_id)
+        store.set_verify_status(job_id, "unverified", detail=None)
+    else:
+        store.delete_job(job_id)
+    logger.info("deleted %s (%s) job %d in %.0fs, freed %.1f GB%s",
+                job.slug, job.repo_type, job_id, elapsed, before / 1e9,
+                ", requeued for re-download" if requeue else "")
+
+
+def start_delete(job_id, store, settings, requeue: bool = False,
+                 remover=delete_backup_files) -> threading.Thread:
+    """Mark the job 'deleting' now (so the very next dashboard poll shows it)
+    and run run_delete_job on a daemon thread.
+
+    Not the download executor: with MAX_CONCURRENT_JOBS=1 a delete there would
+    wait behind a multi-hour download (and vice versa). Daemon so a systemd stop
+    is never delayed by an in-flight rmtree — the job stays 'deleting' in the DB
+    and the startup hook re-submits it (rmtree of a half-removed tree is
+    idempotent; a missing directory is a no-op).
+    """
+    store.set_status(job_id, DELETING)
+    t = threading.Thread(
+        target=run_delete_job, args=(job_id, store, settings),
+        kwargs=dict(requeue=requeue, remover=remover),
+        daemon=True, name=f"delete-{job_id}",
+    )
+    t.start()
+    return t
 
 
 class _StopHandle:
@@ -281,8 +358,9 @@ def run_backup_job(job_id, store, settings, api=None, launcher=None,
         elif intent == "pause":
             store.set_status(job_id, PAUSED)
         elif intent == "cancel":
-            delete_backup_files(settings.backup_dir, job.repo_type, job.slug)
-            store.delete_job(job_id)
+            # Hand the rmtree to a deleter thread so this slot frees now; the job
+            # shows 'deleting' until its files and row are gone.
+            start_delete(job_id, store, settings)
         elif intent == "requeue":
             # Global pause: stop and return to the queue (keep files), no retry change.
             store.set_status(job_id, "queued")
@@ -395,11 +473,13 @@ DISPATCH_INTERVAL = 1.0
 
 class JobRunner:
     def __init__(self, store, settings, api=None, launcher=None,
-                 dispatch_interval: float = DISPATCH_INTERVAL) -> None:
+                 dispatch_interval: float = DISPATCH_INTERVAL,
+                 remover=delete_backup_files) -> None:
         self._store = store
         self._settings = settings
         self._api = api
         self._launcher = launcher
+        self._remover = remover
         self._interval = dispatch_interval
         self._stopping = threading.Event()
         self._registry = RunningRegistry()
@@ -443,6 +523,12 @@ class JobRunner:
         """Stop a running download; the worker deletes its files + row once the
         child dies. Returns True if a live download was terminated."""
         return self._registry.request(job_id, "cancel")
+
+    def delete(self, job_id, requeue: bool = False) -> threading.Thread:
+        """Discard a job's files in the background (status 'deleting'), then
+        drop its row — or requeue it for a fresh download when `requeue`."""
+        return start_delete(job_id, self._store, self._settings,
+                            requeue=requeue, remover=self._remover)
 
     def verify(self, job_id) -> None:
         """Run an integrity check on a completed job (manual Verify button). Marks
