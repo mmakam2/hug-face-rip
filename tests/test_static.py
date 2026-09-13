@@ -84,3 +84,11 @@ def test_deleting_rows_render_without_actions(client):
     assert ".st.deleting" in page          # deleting status has its own color rule
     assert "deleting…" in page             # explicit in-progress label
     assert 'j.status === "deleting"' in page  # row template branches on it (no buttons)
+
+
+def test_multi_target_ui_present(client):
+    page = client.get("/").text
+    assert 'id="target"' in page             # target <select> beside the slug input
+    assert "s.targets" in page               # storage panel iterates the targets list
+    assert "badge target" in page            # per-row target badge
+    assert "offline" in page                 # offline state rendered
