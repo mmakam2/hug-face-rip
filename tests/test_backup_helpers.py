@@ -99,19 +99,16 @@ def test_directory_size_survives_file_vanishing_between_is_file_and_stat(tmp_pat
     (tmp_path / "b.bin").write_bytes(b"y" * 5)
 
     real_stat = Path.stat
-    stat_calls = {}
 
-    def flaky_stat(self, *args, **kwargs):
+    def vanished_stat(self, *args, **kwargs):
         if self.name == "b.bin":
-            # 1st stat call is is_file()'s (let it pass so the file looks present);
-            # 2nd is the st_size read — raise, simulating the file vanishing in
-            # exactly that window.
-            stat_calls["b"] = stat_calls.get("b", 0) + 1
-            if stat_calls["b"] >= 2:
-                raise FileNotFoundError(f"[Errno 2] No such file: '{self}'")
+            raise FileNotFoundError(f"[Errno 2] No such file: '{self}'")
         return real_stat(self, *args, **kwargs)
 
-    with _mock.patch.object(Path, "stat", flaky_stat):
+    # Patch is_file() separately rather than counting stat calls: whether it goes
+    # through Path.stat is a Python implementation detail (since 3.14 it doesn't).
+    with _mock.patch.object(Path, "is_file", lambda self: True), \
+            _mock.patch.object(Path, "stat", vanished_stat):
         result = directory_size(tmp_path)
 
     assert result == 20   # b.bin vanished before its size was read; only a.bin counted
