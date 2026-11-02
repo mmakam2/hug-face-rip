@@ -33,6 +33,21 @@ default; overrides `BACKUP_DIR`), `MAX_CONCURRENT_JOBS` (default 2), `MAX_WORKER
 (default 8), `DB_PATH` (default `jobs.db`), `STALL_TIMEOUT_SECONDS` (default 600; 0 disables the
 stall watchdog). See `.env.example`.
 
+**`.venv` is tied to the system Python, so an OS upgrade can break it.** `.venv/bin/python` is a
+symlink to `/usr/bin/python3`, and a release upgrade that changes the Python minor version removes
+the old interpreter and strands everything installed in the venv (25.04 → 26.04 went 3.13 → 3.14).
+Before such an upgrade, stop the service, save `pip freeze` output, and check the pins have wheels
+for the new Python (`pip install --dry-run --python-version …`). Afterwards, before rebooting, since
+the unit is enabled and starts on boot: move the old venv aside, rebuild it, reinstall the same pins,
+and run the tests. `python3-venv` isn't installed, so create the venv with `--without-pip` and use
+the old venv's pip, which is pure Python, to install into it:
+
+```bash
+python3 -m venv --without-pip .venv
+python3 -I <old-venv>/lib/python3.X/site-packages/pip --python .venv/bin/python \
+  install --only-binary=:all: pip -r <saved-freeze>.txt
+```
+
 ## Architecture
 
 The app is built around **dependency injection so tests never hit the network**. `create_app()`,
